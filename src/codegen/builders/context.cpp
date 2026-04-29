@@ -251,9 +251,23 @@ void BuilderContext::emit_function_call(uint32_t address) {
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
 
-  // Use classifyTarget for consistent branch classification
-  // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  // Fast path: if `fn` (the function we're currently emitting) already has a
+  // `loc_<target>:` label inside one of its blocks for this address, force
+  // InternalLabel classification. The default classifyTarget(target, base,
+  // false) goes through getFunctionContaining(base), which returns the
+  // wrong function when multiple functions overlap (e.g. RenderWare-style
+  // helper sub_X at base+0xC inside a larger sub_Y -- both contain `base`,
+  // but only sub_Y contains the target). Using fn directly eliminates the
+  // ambiguity. We require both isLabel (so the codegen emits `loc_X:`) and
+  // containsAddress (so the label is actually inside an emitted block --
+  // labels outside blocks never get a `loc_X:` line).
+  TargetKind kind;
+  if (target == fn.base() || (fn.isLabel(target) && fn.containsAddress(target))) {
+    kind = TargetKind::InternalLabel;
+  } else {
+    // false = branch instruction (not a call), so own-base means loop back
+    kind = graph().classifyTarget(target, base, false);
+  }
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -283,18 +297,45 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           println("\t}}");
         }
       } else {
-        REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X} (no CallTarget)",
-                         target, base);
-        println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
-                not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+        // classifyTarget said the target is a function entry, but no
+        // CallEdge was recorded for this site (typically because the target
+        // got registered AFTER the caller was sealed and `tryResolveAgainst`
+        // can't mutate sealed functions). Rather than hard-trapping, emit an
+        // indirect dispatch via REX_LOOKUP_FUNC -- the runtime function
+        // dispatcher resolves the address, falling back to the unregistered
+        // handler if needed (which logs and routes to the nearest entry).
+        REXCODEGEN_WARN(
+            "Unresolved conditional branch to 0x{:08X} from 0x{:08X}: emitting indirect dispatch",
+            target, base);
+        println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+        if (!config().skipLr) {
+          println("\t\tctx.lr = 0x{:X};", base + 4);
+        }
+        // Set ctr so the runtime fallback handler (in xmemory.cpp) can
+        // recover the intended target if the slot is unregistered.
+        println("\t\tctx.ctr.u32 = 0x{:08X};", target);
+        println("\t\tREX_CALL_INDIRECT_FUNC(0x{:08X});", target);
+        println("\t\treturn;");
+        println("\t}}");
       }
       break;
 
     case TargetKind::Unknown:
-      REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X}", target, base);
-      println("\t// ERROR: conditional branch to unknown address 0x{:08X}", target);
-      println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
-              not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+      // Same fallback as above -- emit an indirect dispatch instead of
+      // REX_FATAL. The function table's runtime fallback handler logs the
+      // unresolved target and routes to the nearest registered entry, which
+      // is much more useful than a hard abort during boot.
+      REXCODEGEN_WARN(
+          "Unresolved conditional branch to 0x{:08X} from 0x{:08X}: emitting indirect dispatch",
+          target, base);
+      println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+      if (!config().skipLr) {
+        println("\t\tctx.lr = 0x{:X};", base + 4);
+      }
+      println("\t\tctx.ctr.u32 = 0x{:08X};", target);
+      println("\t\tREX_CALL_INDIRECT_FUNC(0x{:08X});", target);
+      println("\t\treturn;");
+      println("\t}}");
       break;
   }
 }

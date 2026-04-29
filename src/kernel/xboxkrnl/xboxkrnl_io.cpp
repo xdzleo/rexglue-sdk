@@ -29,6 +29,8 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+#include <cctype>
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
@@ -100,6 +102,32 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
   return true;
 }
 
+static bool ContainsAsciiCaseInsensitive(std::string_view value, std::string_view needle) {
+  if (needle.empty() || value.size() < needle.size()) {
+    return false;
+  }
+  for (size_t i = 0; i <= value.size() - needle.size(); ++i) {
+    bool matched = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      unsigned char a = static_cast<unsigned char>(value[i + j]);
+      unsigned char b = static_cast<unsigned char>(needle[j]);
+      if (std::tolower(a) != std::tolower(b)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsVideoIoPath(std::string_view path) {
+  return ContainsAsciiCaseInsensitive(path, "movies") ||
+         ContainsAsciiCaseInsensitive(path, ".vp6");
+}
+
 u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
@@ -123,15 +151,31 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   // Compute path, possibly attrs relative.
   auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  const bool trace_video_io = IsVideoIoPath(target_path);
   REXKRNL_IMPORT_TRACE(
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
       (uint32_t)creation_disposition, (uint32_t)create_options);
+  if (trace_video_io) {
+    REXLOG_INFO("[VIDEO_IO] NtCreateFile path='{}' access={:08X} share={:08X} disp={:08X} "
+                "options={:08X} root={:08X}",
+                target_path, static_cast<uint32_t>(desired_access),
+                static_cast<uint32_t>(share_access),
+                static_cast<uint32_t>(creation_disposition),
+                static_cast<uint32_t>(create_options),
+                static_cast<uint32_t>(object_attrs->root_directory));
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
     return X_STATUS_OBJECT_NAME_INVALID;
   }
+
+  // (VP6 video file deny: tested but caused the same 16-second self-exit
+  // because the game's "no intro available" fallback path has its own
+  // missing-vtable cascade. Letting the file open succeed is at least as
+  // far through the boot as denying it. Leaving the open enabled and
+  // letting MoviePlayer2 handle the failure naturally.)
 
   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       object_attrs->root_directory != 0) {
@@ -168,6 +212,11 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
 
   *handle_out = handle;
+  if (trace_video_io) {
+    REXLOG_INFO("[VIDEO_IO] NtCreateFile result={:08X} handle={:08X} action={}",
+                static_cast<uint32_t>(result), static_cast<uint32_t>(handle),
+                static_cast<uint32_t>(file_action));
+  }
   if (XFAILED(result)) {
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
@@ -569,6 +618,14 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name);
+  const bool trace_video_io =
+      IsVideoIoPath(name) || (file && (IsVideoIoPath(file->path()) || IsVideoIoPath(file->name())));
+  if (trace_video_io) {
+    REXLOG_INFO("[VIDEO_IO] NtQueryDirectoryFile handle={:08X} dir='{}' pattern='{}' "
+                "len={} restart={}",
+                static_cast<uint32_t>(file_handle), file ? file->path() : "<missing>",
+                name, static_cast<uint32_t>(length), static_cast<uint32_t>(restart_scan));
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(name, true)) {
@@ -592,6 +649,14 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
   if (io_status_block) {
     io_status_block->status = result;
     io_status_block->information = info;
+  }
+  if (trace_video_io) {
+    const char* found_name = XSUCCEEDED(result) ? file_info_ptr->file_name : "";
+    uint32_t found_len =
+        XSUCCEEDED(result) ? static_cast<uint32_t>(file_info_ptr->file_name_length) : 0;
+    REXLOG_INFO("[VIDEO_IO] NtQueryDirectoryFile result={:08X} info={} found='{}'",
+                static_cast<uint32_t>(result), info,
+                std::string_view(found_name, found_len));
   }
 
   return result;

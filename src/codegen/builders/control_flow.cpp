@@ -27,9 +27,20 @@ namespace rex::codegen {
 bool build_b(BuilderContext& ctx) {
   uint32_t target = ctx.insn.operands[0];
 
-  // Use graph to classify the target - handles thunks that branch to nearby functions
-  // false = branch instruction (not a call), so own-base means loop back
-  auto kind = ctx.graph().classifyTarget(target, ctx.base, false);
+  // Fast path: if the function being emitted already has a `loc_<target>:`
+  // label inside one of its blocks, force InternalLabel. See
+  // emit_conditional_branch for rationale -- overlapping functions cause
+  // classifyTarget(target, base) to pick the wrong caller and miss internal
+  // labels. Labels outside blocks never get a `loc_X:` line, so we require
+  // both isLabel and containsAddress to be safe.
+  TargetKind kind;
+  if (target == ctx.fn.base() || (ctx.fn.isLabel(target) && ctx.fn.containsAddress(target))) {
+    kind = TargetKind::InternalLabel;
+  } else {
+    // Use graph to classify the target - handles thunks that branch to nearby functions
+    // false = branch instruction (not a call), so own-base means loop back
+    kind = ctx.graph().classifyTarget(target, ctx.base, false);
+  }
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -83,9 +94,15 @@ bool build_bl(BuilderContext& ctx) {
       break;
 
     case TargetKind::Unknown:
-      REXCODEGEN_ERROR("Unresolved bl target 0x{:08X} from 0x{:08X}", target, ctx.base);
-      ctx.println("\t// ERROR: unresolved bl target 0x{:08X}", target);
-      ctx.println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", ctx.base, target);
+      // Emit indirect dispatch via the function table -- the runtime
+      // fallback handler logs and routes to the nearest entry, which is
+      // much more useful than a hard REX_FATAL during boot.
+      REXCODEGEN_WARN(
+          "Unresolved bl target 0x{:08X} from 0x{:08X}: emitting indirect dispatch", target,
+          ctx.base);
+      ctx.println("\tctx.ctr.u32 = 0x{:08X};", target);
+      ctx.println("\tREX_CALL_INDIRECT_FUNC(0x{:08X});", target);
+      ctx.csrState = CSRState::Unknown;
       break;
   }
   return true;

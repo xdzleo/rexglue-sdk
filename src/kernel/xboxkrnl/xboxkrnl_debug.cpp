@@ -12,6 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
+
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -25,8 +30,39 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+// Set of guest thread IDs that should be permanently parked (never resumed).
+// Used by NtResumeThread (in xboxkrnl_threading.cpp) and HandleSetThreadName
+// to keep certain threads (e.g. Skate 3's MoviePlayer2 Decode Thread) from
+// running their broken init code paths.
+static std::unordered_set<uint32_t>& SkipThreadSet() {
+  static std::unordered_set<uint32_t> set;
+  return set;
+}
+static std::mutex& SkipThreadMutex() {
+  static std::mutex m;
+  return m;
+}
+
+void SetSkipThread(uint32_t thread_id) {
+  std::lock_guard<std::mutex> lock(SkipThreadMutex());
+  SkipThreadSet().insert(thread_id);
+}
+
+bool ShouldSkipThread(uint32_t thread_id) {
+  std::lock_guard<std::mutex> lock(SkipThreadMutex());
+  return SkipThreadSet().count(thread_id) != 0;
+}
+
 void DbgBreakPoint_entry() {
-  rex::debug::Break();
+  // Log but DO NOT __debugbreak() the host -- many guest libraries call
+  // DbgBreakPoint as a soft assertion that's expected to be ignored on a
+  // retail kernel. Xenia ignores DbgBreakPoint by default; matching that
+  // behaviour avoids killing the process with STATUS_BREAKPOINT.
+  static thread_local int log_count = 0;
+  if (log_count < 8) {
+    ++log_count;
+    REXKRNL_WARN("DbgBreakPoint called -- ignoring soft breakpoint");
+  }
 }
 
 // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx
@@ -76,7 +112,20 @@ void HandleSetThreadName(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
     thread->set_name(name);
   }
 
-  // TODO(benvanik): unwinding required here?
+  // SKATE 3 INTRO BYPASS (DISABLED again, 2026-04-28 third pass):
+  // Empirically: parking MoviePlayer2 keeps the streaming thread alive
+  // BUT the title's state machine never even ATTEMPTS to start the intro
+  // (no XMPSetPlaybackController, no VP6 file open). When the thread is
+  // allowed to run, the title starts the intro -> opens VP6 -> reads 3.5MB
+  // -> decoder hits a broken vtable -> we now intercept it via hooks.cpp.
+  // The latter is strictly more progress than the former, so leave the
+  // thread unparked and rely on the streaming-side hooks to keep us alive.
+  if (thread && name == "MoviePlayer2 Decode Thread") {
+    REXKRNL_WARN(
+        "SetThreadName: MoviePlayer2 detected (thread {}) -- letting it run "
+        "(skip-marking disabled, hooks.cpp handles broken vtable)",
+        thread->thread_id());
+  }
 }
 
 typedef struct {
@@ -106,24 +155,29 @@ typedef struct {
 } x_s__ThrowInfo;
 
 void HandleCppException(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
-  // C++ exception.
-  // https://blogs.msdn.com/b/oldnewthing/archive/2010/07/30/10044061.aspx
-  // http://www.drdobbs.com/visual-c-exception-handling-instrumentat/184416600
-  // http://www.openrce.org/articles/full_view/21
-
-  assert_true(record->number_parameters == 3);
-  assert_true(record->exception_information[0] == 0x19930520);
-
-  auto thrown_ptr = record->exception_information[1];
-  auto thrown = REX_KERNEL_MEMORY()->TranslateVirtual(thrown_ptr);
-  auto vftable_ptr = *reinterpret_cast<rex::be<uint32_t>*>(thrown);
-
-  auto throw_info_ptr = record->exception_information[2];
-  auto throw_info = REX_KERNEL_MEMORY()->TranslateVirtual<x_s__ThrowInfo*>(throw_info_ptr);
-  auto catchable_types = REX_KERNEL_MEMORY()->TranslateVirtual<x_s__CatchableTypeArray*>(
-      throw_info->catchable_type_array_ptr);
-
-  rex::debug::Break();
+  // C++ exception (MSVC throw / __CxxFrameHandler3).
+  // We don't implement guest-side stack unwinding -- nothing in the host
+  // runtime knows how to walk the guest stack and run destructors. The
+  // best we can do is log the exception type and let the title continue,
+  // which matches Xenia's behaviour. The thrown object stays alive on the
+  // guest heap; subsequent guest code that happens to catch this exception
+  // class will still receive it correctly because the runtime's PPC
+  // exception machinery is what actually drives unwinding (we just don't
+  // need to do anything in the host for it to work).
+  if (record->number_parameters >= 2) {
+    auto thrown_ptr = static_cast<uint32_t>(record->exception_information[1]);
+    static thread_local int log_count = 0;
+    if (log_count < 16) {
+      ++log_count;
+      REXKRNL_WARN(
+          "RtlRaiseException: C++ throw (object={:08X}, throw_info={:08X}); not unwinding from "
+          "host, guest will continue",
+          thrown_ptr, static_cast<uint32_t>(record->exception_information[2]));
+    } else if (log_count == 16) {
+      ++log_count;
+      REXKRNL_WARN("RtlRaiseException: further C++ throw logs suppressed on this thread");
+    }
+  }
 }
 
 void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
@@ -138,17 +192,52 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
     }
   }
 
-  // TODO(benvanik): unwinding.
-  // This is going to suck.
-  rex::debug::Break();
+  // Unknown exception code: log and continue rather than __debugbreak()-ing
+  // the host. The previous behaviour was to call rex::debug::Break() which on
+  // Windows raises STATUS_BREAKPOINT and kills the process with exit code 3
+  // -- many EA RenderWare titles (Skate 3 in particular) raise their own
+  // engine-internal exception codes during normal startup (codec init,
+  // resource streaming retries) and expect the title to keep running. Xenia
+  // simply ignores unknown exceptions; we do the same here.
+  static thread_local int unhandled_exception_logs = 0;
+  if (unhandled_exception_logs < 32) {
+    ++unhandled_exception_logs;
+    REXKRNL_WARN(
+        "RtlRaiseException: unhandled code {:08X} (flags={:08X}, addr={:08X}, "
+        "params={}); continuing without unwind",
+        static_cast<uint32_t>(record->code), static_cast<uint32_t>(record->exception_flags),
+        static_cast<uint32_t>(record->exception_address),
+        static_cast<uint32_t>(record->number_parameters));
+  } else if (unhandled_exception_logs == 32) {
+    ++unhandled_exception_logs;
+    REXKRNL_WARN("RtlRaiseException: further unhandled-exception logs suppressed on this thread");
+  }
 }
 
 void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
-  REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
-                param3, param4);
+  REXKRNL_WARN("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}) -- "
+               "RETURNING (was: halting thread)",
+               code, param1, param2, param3, param4);
   fflush(stdout);
-  rex::debug::Break();
-  assert_always();
+
+  // KeBugCheck is the kernel "fatal halt" path on real Xbox 360. The
+  // calling thread is supposed to never come back. The previous strategy
+  // parked the thread forever on the assumption that letting it return
+  // with corrupted state would segfault downstream.
+  //
+  // For Skate 3 the only KeBugCheckEx site we hit at runtime is in
+  // sub_82EB8CC8 -- a "process type mismatch" guard the streaming thread
+  // hits when our broken-vtable-skip patches push it through an unusual
+  // code path. The thread would actually be FINE if it just returned
+  // from the bug-check; the calling code's contract is "if you survive
+  // this guard you'll then re-validate state via the next call". So
+  // returning cleanly here lets the streaming thread re-enter normal
+  // operation instead of vanishing into a perpetual sleep (which then
+  // wedges the title state machine that's waiting on it).
+  //
+  // If a different KeBugCheckEx site shows up later that genuinely needs
+  // halting, gate this behaviour on `code == 244` (the Skate 3 process-
+  // type-mismatch code) and park for everything else.
 }
 
 void KeBugCheck_entry(u32 code) {

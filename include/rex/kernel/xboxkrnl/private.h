@@ -11,4 +11,15 @@
 
 #pragma once
 
-namespace rex::kernel::xboxkrnl {}  // namespace rex::kernel::xboxkrnl
+#include <cstdint>
+
+namespace rex::kernel::xboxkrnl {
+
+// Mark a guest thread to never be resumed. Called by HandleSetThreadName
+// when it detects a thread we know is going to crash if it runs (e.g.
+// Skate 3's MoviePlayer2 Decode Thread). NtResumeThread checks this set
+// and refuses to resume the host thread for any flagged guest TID.
+void SetSkipThread(uint32_t thread_id);
+bool ShouldSkipThread(uint32_t thread_id);
+
+}  // namespace rex::kernel::xboxkrnl

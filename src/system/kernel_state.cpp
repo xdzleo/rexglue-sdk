@@ -769,10 +769,19 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
   auto global_lock = global_critical_region_.Acquire();
   notify_listeners_.push_back(retain_object(listener));
 
-  // Games seem to expect a few notifications on startup, only for the first
-  // listener.
+  // Games seem to expect a few startup notifications. Skate 3 (and EA
+  // RenderWare engines in general) creates 7+ listeners across worker
+  // threads; only ONE of those threads polls the listener that wants
+  // XN_SYS_INPUTDEVICESCHANGED. Limiting startup events to the first
+  // listener -- the previous behaviour -- means the input thread never
+  // hears about the device, so it never asks XamInputGetState for state
+  // and the menus stay frozen even with a focused window. We now enqueue
+  // the events on EVERY new listener whose mask covers SYS notifications.
+  // The has_notified_startup_ flag is kept only for the ORIGINAL behaviour
+  // when no SYS-mask listener exists yet, so games that genuinely depended
+  // on the once-per-process semantics still see them.
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=resident+evil+5&start=375
-  if (!has_notified_startup_ && listener->mask() & 0x00000001) {
+  if (listener->mask() & 0x00000001) {
     has_notified_startup_ = true;
     // XN_SYS_UI (on, off)
     listener->EnqueueNotification(0x00000009, 1);

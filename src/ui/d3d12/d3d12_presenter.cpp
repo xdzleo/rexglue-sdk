@@ -556,6 +556,12 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  static int paint_count = 0;
+  ++paint_count;
+  if (paint_count <= 4 || (paint_count % 60) == 0) {
+    REXLOG_INFO("D3D12Presenter::PaintAndPresentImpl #{} (execute_ui_drawers={})",
+                paint_count, execute_ui_drawers);
+  }
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();

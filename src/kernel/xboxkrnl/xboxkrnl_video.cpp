@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -338,6 +339,8 @@ void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
   // r3 = result of MmGetPhysicalAddress
   // r4 = log2(size)
   // Buffer pointers are from MmAllocatePhysicalMemory with WRITE_COMBINE.
+  REXKRNL_INFO("VdInitializeRingBuffer ptr={:08X} size_log2={}",
+               ptr.guest_address(), int(size_log2));
   auto* graphics_system =
       static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
   if (!graphics_system)
@@ -347,6 +350,8 @@ void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
 
 void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2) {
   // r4 = log2(block size), 6, usually --- <=19
+  REXKRNL_INFO("VdEnableRingBufferRPtrWriteBack ptr={:08X} block_size_log2={}",
+               ptr.guest_address(), int(block_size_log2));
   auto* graphics_system =
       static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
   if (!graphics_system)
@@ -355,6 +360,11 @@ void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2)
 }
 
 void VdGetSystemCommandBuffer_entry(mapped_void p0_ptr, mapped_void p1_ptr) {
+  static int call_count = 0;
+  if (++call_count <= 4 || (call_count % 60) == 0) {
+    REXKRNL_INFO("VdGetSystemCommandBuffer #{} p0={:08X} p1={:08X}",
+                 call_count, p0_ptr.guest_address(), p1_ptr.guest_address());
+  }
   p0_ptr.Zero(0x94);
   memory::store_and_swap<uint32_t>(p0_ptr, 0xBEEF0000);
   memory::store_and_swap<uint32_t>(p1_ptr, 0xBEEF0001);
@@ -450,6 +460,17 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  static int swap_count = 0;
+  if (++swap_count <= 4 || (swap_count % 60) == 0) {
+    uint32_t fmt_val = texture_format_ptr ? uint32_t(*texture_format_ptr) : 0u;
+    uint32_t cs_val = color_space_ptr ? uint32_t(*color_space_ptr) : 0u;
+    uint32_t w_val = width ? uint32_t(*width) : 0u;
+    uint32_t h_val = height ? uint32_t(*height) : 0u;
+    REXKRNL_INFO("VdSwap #{} buf={:08X} fetch={:08X} fb={:08X} fmt={:08X} cs={:08X} w={} h={}",
+                 swap_count, buffer_ptr.guest_address(), fetch_ptr.guest_address(),
+                 frontbuffer_ptr.guest_address(),
+                 fmt_val, cs_val, w_val, h_val);
+  }
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
@@ -523,6 +544,14 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+
+  // ReXGlue note: We initially force-dispatched IssueSwap from here because
+  // we believed the title's swap packet was lost. Diagnostic packet counter
+  // proved otherwise -- the CP processes 1000+ PM4_XE_SWAP packets per 25s
+  // run via the natural ringbuffer path. Forcing IssueSwap with stale
+  // fetch state was actually overriding the correct presentation. The
+  // natural path already does the work; this entry just writes the swap
+  // packet to the system buffer.
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

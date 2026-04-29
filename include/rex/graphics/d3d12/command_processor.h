@@ -639,6 +639,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
   uint64_t fxaa_source_texture_submission_ = 0;
 
+  // ReXGlue VP6 intro overlay. Lazy-created the first time the title's
+  // intro VP6 wants a frame on screen. Path: hooks.cpp signals VP6
+  // playback active via Skate3VP6_PlaybackActive() (weak C symbol);
+  // IssueSwap pulls latest decoded RGBA via Skate3VP6_CopyCurrentRgba()
+  // and substitutes the swap source. Sized 1280x720 BGRA8.
+  // (Skate 3 specific. Removed after EOF or when the title's natural
+  // swap path resumes.)
+  Microsoft::WRL::ComPtr<ID3D12Resource> vp6_overlay_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> vp6_overlay_upload_;
+  uint32_t vp6_overlay_width_ = 0;
+  uint32_t vp6_overlay_height_ = 0;
+  uint64_t vp6_overlay_upload_size_ = 0;
+  uint32_t vp6_overlay_upload_pitch_ = 0;
+
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;
 

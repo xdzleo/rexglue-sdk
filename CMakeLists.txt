@@ -110,6 +110,14 @@ add_compile_options(
     -fno-char8_t
 )
 
+# Clang on x86_64 doesn't enable SSSE3/SSE4 by default. rexcore uses
+# `_mm_shuffle_epi8` (SSSE3) for byte-swap copy paths; the per-target helper
+# only applies SSE4.1 to *executables*, not static libs, so rexcore would
+# fail to compile. Apply globally for x86_64.
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    add_compile_options(-msse4.1)
+endif()
+
 # Platform detection (supports AMD64 and ARM64)
 if(WIN32)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")

@@ -16,6 +16,7 @@
 #include "platform_win.h"
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
 namespace rex::arch {
@@ -97,6 +98,18 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
       }
       return EXCEPTION_CONTINUE_EXECUTION;
     }
+  }
+  if (ex_info->ExceptionRecord->ExceptionCode == STATUS_ACCESS_VIOLATION) {
+    REXSYS_ERROR(
+        "Unhandled access violation: rip={:016X} access={:016X} op={} eflags={:08X}",
+        static_cast<uint64_t>(ex_info->ContextRecord->Rip),
+        static_cast<uint64_t>(ex_info->ExceptionRecord->ExceptionInformation[1]),
+        static_cast<uint64_t>(ex_info->ExceptionRecord->ExceptionInformation[0]),
+        static_cast<uint32_t>(ex_info->ContextRecord->EFlags));
+  } else {
+    REXSYS_ERROR("Unhandled exception: code={:08X} rip={:016X}",
+                 static_cast<uint32_t>(ex_info->ExceptionRecord->ExceptionCode),
+                 static_cast<uint64_t>(ex_info->ContextRecord->Rip));
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }

@@ -48,9 +48,9 @@ Result<void> Analyze(CodegenContext& ctx) {
     return discoverResult;
   }
 
-  // 3.5. Function pointer scan: find lis/addi pairs loading code addresses
-  // TODO(tomc): disabled for now, causes too many false positives
-  // functionPointerScan(ctx);
+  // 3.5. Function pointer scan now happens inside Discover (after vtable scan)
+  // so it can use the existing iterative-discovery loop without exposing a new
+  // public symbol.
 
   // 4. Gap fill uncovered regions + discover blocks for gap-filled functions + cleanup
   auto gapFillResult = phases::GapFill(ctx);

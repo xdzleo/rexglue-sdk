@@ -62,6 +62,16 @@ class VTableScanner {
   // Scan for all vtables via RTTI traversal
   std::vector<VTableInfo> scan();
 
+  // Scan .rdata for sequences of function-like addresses (no RTTI required).
+  // This is a heuristic backup for binaries that strip RTTI (like many EA
+  // RenderWare titles -- Skate 3 included): every C++ class still has a
+  // vtable laid out as a contiguous run of dwords pointing into .text, but
+  // without the Complete Object Locator the RTTI scanner has nothing to
+  // anchor on. We walk .rdata 4 bytes at a time looking for runs of 4+
+  // consecutive valid function addresses (with NULL slots tolerated mid-run
+  // for abstract methods) and treat those as vtables.
+  std::vector<VTableInfo> scanHeuristic();
+
  private:
   const BinaryView& binary_;
 

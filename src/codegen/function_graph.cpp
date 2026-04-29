@@ -805,12 +805,27 @@ bool FunctionGraph::removeFunction(uint32_t entryPoint) {
 }
 
 FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) {
-  // O(log f) lookup via sorted base index: find last function with base <= addr
+  // Walk down the base-sorted index from the closest base below `addr` until
+  // we find a function whose blocks actually cover `addr`. The previous
+  // implementation returned the first candidate even when its blocks didn't
+  // contain `addr`, which fails for overlapping functions: e.g. a tiny
+  // PDATA-derived helper sub_X (0x823F1790, 20 bytes) sitting inside the
+  // range of a larger merged function sub_Y (covers 0x823F14B8-0x823F1800)
+  // -- the closest base below 0x823F17AC is sub_X, which does NOT contain
+  // 0x823F17AC, but sub_Y does. Without this walk we'd return nullptr and
+  // classifyTarget falls into TargetKind::Unknown, planting REX_FATAL traps
+  // for what are actually internal labels.
   auto it = functionsByBase_.upper_bound(addr);
-  if (it != functionsByBase_.begin()) {
+  while (it != functionsByBase_.begin()) {
     --it;
     if (it->second->containsAddress(addr)) {
       return it->second;
+    }
+    // Stop walking once we're far enough below `addr` that no remaining
+    // function could plausibly cover it. Pick a generous cap so giant
+    // RenderWare-style functions (>500 KB after merges) still resolve.
+    if (it->first + 0x100000 < addr) {
+      break;
     }
   }
   return nullptr;
@@ -818,10 +833,13 @@ FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) {
 
 const FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) const {
   auto it = functionsByBase_.upper_bound(addr);
-  if (it != functionsByBase_.begin()) {
+  while (it != functionsByBase_.begin()) {
     --it;
     if (it->second->containsAddress(addr)) {
       return it->second;
+    }
+    if (it->first + 0x100000 < addr) {
+      break;
     }
   }
   return nullptr;
@@ -1190,8 +1208,22 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
 
   // Case 3: Target is a DIFFERENT function's entry point - this is a call/tail-call
   // This handles cases where a small thunk function branches to another function
-  // whose entry point happens to fall within the thunk's address range
+  // whose entry point happens to fall within the thunk's address range.
+  //
+  // CAVEAT: when the caller's blocks ALREADY include `target` AND the caller
+  // emitted a `loc_<target>:` label for it (e.g. the caller was discovered
+  // first with funcEnd extended past `target`, then later another function
+  // entry got registered AT `target` by the function-pointer scan), prefer
+  // treating it as an internal label so the codegen `goto`s the existing
+  // label rather than calling the external function. We require the label
+  // to actually be in the caller's labels_ set -- otherwise the codegen
+  // would emit `goto loc_<target>;` to a label that doesn't exist in the
+  // function body, causing a compile error.
   if (isEntryPoint(target)) {
+    if (callerFn && callerFn != getFunction(target) &&
+        callerFn->containsAddress(target) && callerFn->isLabel(target)) {
+      return TargetKind::InternalLabel;
+    }
     return TargetKind::Function;
   }
 

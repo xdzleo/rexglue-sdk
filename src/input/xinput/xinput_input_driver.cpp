@@ -162,6 +162,8 @@ X_RESULT XinputInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_sta
 
   out_state->packet_number = native_state.state.dwPacketNumber;
   out_state->gamepad.buttons = native_state.state.Gamepad.wButtons;
+  // (cycle 11: removed auto-A press - it dismissed the logo too quickly
+  // and made things worse. Title needs natural state advancement.)
   out_state->gamepad.left_trigger = native_state.state.Gamepad.bLeftTrigger;
   out_state->gamepad.right_trigger = native_state.state.Gamepad.bRightTrigger;
   out_state->gamepad.thumb_lx = native_state.state.Gamepad.sThumbLX;

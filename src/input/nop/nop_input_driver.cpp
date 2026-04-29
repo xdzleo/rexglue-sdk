@@ -26,19 +26,30 @@ X_STATUS NopInputDriver::Setup() {
   return X_STATUS_SUCCESS;
 }
 
-// Spoof a connected controller for user 0 so games don't pause
+// Spoof a connected controller for ALL 4 user slots so games don't pause
 // waiting for input. Returns idle state (no buttons pressed).
+//
+// Returning DEVICE_NOT_CONNECTED for users 1-3 (which the original code
+// did) breaks EA RenderWare titles (Skate 3, SSX, etc). Those titles poll
+// XamInputGetCapabilities for users 0-3, and if ANY of them ever returned
+// DEVICE_NOT_CONNECTED the input pipeline stalled before it ever called
+// XamInputGetState. Mirrors UnleashedRecomp's hid::GetCapabilities, which
+// returns SUCCESS for any active controller without per-slot gating.
 
 X_RESULT NopInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                          X_INPUT_CAPABILITIES* out_caps) {
-  if (user_index != 0) {
+  if (user_index >= 4) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_caps) {
     std::memset(out_caps, 0, sizeof(*out_caps));
-    out_caps->type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
-    out_caps->sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
-    out_caps->flags = 0;
+    out_caps->type = 0x01;  // XINPUT_DEVTYPE_GAMEPAD
+    // Same fix as the XamInputGetCapabilities synth path: Skate 3 / EA
+    // RenderWare expects sub_type=2 and flags bit 0 set; with the rexglue
+    // defaults of (1, 0) the games' capability gate fails and they refuse
+    // to read controller state.
+    out_caps->sub_type = 0x02;
+    out_caps->flags = 0x0003;  // bit 0 + bit 1 (Skate 3 / RenderWare gate)
     // Report standard gamepad capabilities
     out_caps->gamepad.buttons = 0xFFFF;  // All buttons supported
     out_caps->gamepad.left_trigger = 0xFF;
@@ -54,7 +65,7 @@ X_RESULT NopInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT NopInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  if (user_index != 0) {
+  if (user_index >= 4) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_state) {
@@ -65,7 +76,7 @@ X_RESULT NopInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 }
 
 X_RESULT NopInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
-  if (user_index != 0) {
+  if (user_index >= 4) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   // Accept vibration but do nothing
@@ -74,7 +85,7 @@ X_RESULT NopInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
 
 X_RESULT NopInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
                                       X_INPUT_KEYSTROKE* out_keystroke) {
-  if (user_index != 0) {
+  if (user_index >= 4) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   // No keystrokes available

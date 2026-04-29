@@ -56,6 +56,151 @@ std::vector<VTableInfo> VTableScanner::scan() {
   return vtables;
 }
 
+std::vector<VTableInfo> VTableScanner::scanHeuristic() {
+  // Heuristic vtable discovery for binaries with no RTTI / no Complete
+  // Object Locators. We scan .rdata at 4-byte intervals looking for runs
+  // of dwords that all decode as valid in-section function pointers. A
+  // "valid" entry is either:
+  //   * an executable address aligned to 4 (treated as a real function)
+  //   * 0 (treated as an abstract method / padding within a vtable)
+  // A run becomes a candidate vtable when we see at least kMinValidEntries
+  // real (non-zero) functions among the first kMaxScanSlots slots, and is
+  // separated from neighbors by either a non-aligned dword, an obviously
+  // non-pointer dword, or a long run of zeros.
+  //
+  // This is necessarily approximate: we may pick up jump tables, function
+  // pointer arrays that aren't C++ vtables, or even short floating-point
+  // arrays that happen to look like code addresses. False positives just
+  // mean a few extra functions get queued for recompilation, which is
+  // fine; false negatives are what we're trying to fix.
+  std::vector<VTableInfo> vtables;
+
+  const auto* rdata = binary_.findSectionByName(".rdata");
+  if (!rdata || !rdata->data) {
+    return vtables;
+  }
+
+  const uint8_t* data = rdata->data;
+  uint32_t base = rdata->baseAddress;
+  size_t size = rdata->size;
+
+  if (size < 16) {
+    return vtables;
+  }
+
+  constexpr size_t kMinValidEntries = 4;     // need >=4 real functions
+  constexpr size_t kMaxScanSlots = 256;      // cap per candidate
+  constexpr int kMaxConsecutiveNulls = 3;    // tolerated mid-vtable
+
+  size_t found = 0;
+
+  // A "looks like a function prologue" sniff. Returns true if the dword
+  // at `funcAddr` starts with one of the common PPC function prologue
+  // patterns (mflr / mfspr lr / stwu r1,-X(r1)). Filters out false-
+  // positive vtable candidates where slot[0] points into the middle of
+  // a function or into raw data that happens to land in .text.
+  auto looksLikePrologue = [&](uint32_t funcAddr) -> bool {
+    const auto* sec = binary_.findSection(funcAddr);
+    if (!sec || !sec->data) return false;
+    uint32_t off = funcAddr - sec->baseAddress;
+    if (off + 4 > sec->size) return false;
+    uint32_t insn = load_and_swap<uint32_t>(sec->data + off);
+
+    // mflr rD: opcode=31, ext=339, the canonical "mflr r12" is 7D8802A6
+    if ((insn & 0xFC0007FE) == 0x7C0002A6) {
+      // mfspr rD, SPR -- check SPR == 8 (LR)
+      uint32_t spr = ((insn >> 16) & 0x1F) | (((insn >> 11) & 0x1F) << 5);
+      if (spr == 8) return true;
+    }
+    // stwu r1, -X(r1): primary opcode 37, with RA == RS == 1
+    // 0x9421FF80 is the canonical "stwu r1, -128(r1)" pattern.
+    if ((insn & 0xFFFF0000) == 0x94210000) {
+      int16_t simm = static_cast<int16_t>(insn & 0xFFFF);
+      if (simm < 0) return true;
+    }
+    // bl __savegprlr_NN  (the recompiled XBox 360 prologue helper).
+    // primary opcode 18, AA=0, LK=1.
+    if ((insn & 0xFC000003) == 0x48000001) return true;
+    return false;
+  };
+
+  for (size_t offset = 0; offset + 4 <= size; offset += 4) {
+    // Quick reject: first dword must be a valid function pointer that
+    // starts with a real prologue. Without this we pick up jump tables
+    // and switch-statement data, whose entries point into the middle of
+    // functions and produce garbage when treated as vtable methods.
+    uint32_t firstSlot = load_and_swap<uint32_t>(data + offset);
+    if (firstSlot == 0 || (firstSlot & 0x3) != 0 || !isExecutableAddress(firstSlot)) {
+      continue;
+    }
+    // (No prologue check -- requiring a prologue in slot[0..3] filtered
+    // out real EA RenderWare vtables whose first method is a
+    // single-instruction trivial destructor or a tail-call helper.
+    // Without the check we get more false positives but also catch
+    // more real vtables; the recompilation pipeline tolerates extra
+    // function entries gracefully -- any false-positive that gets
+    // called at runtime hits the standard NULL-bctrl fallback path
+    // rather than causing a host crash.)
+
+    // Walk forward collecting slots.
+    std::vector<uint32_t> slots;
+    int consecutiveNulls = 0;
+    size_t realCount = 0;
+    size_t walkOffset = offset;
+
+    for (size_t s = 0; s < kMaxScanSlots && walkOffset + 4 <= size; ++s) {
+      uint32_t slot = load_and_swap<uint32_t>(data + walkOffset);
+
+      if (slot == 0) {
+        ++consecutiveNulls;
+        if (consecutiveNulls > kMaxConsecutiveNulls) {
+          break;
+        }
+        slots.push_back(0);
+        walkOffset += 4;
+        continue;
+      }
+
+      if ((slot & 0x3) != 0) {
+        // misaligned -- end of vtable
+        break;
+      }
+      if (!isExecutableAddress(slot)) {
+        // pointer that doesn't go into .text -- end of vtable
+        break;
+      }
+
+      consecutiveNulls = 0;
+      slots.push_back(slot);
+      ++realCount;
+      walkOffset += 4;
+    }
+
+    // Trim trailing NULLs.
+    while (!slots.empty() && slots.back() == 0) {
+      slots.pop_back();
+    }
+
+    if (realCount < kMinValidEntries) {
+      continue;  // too short to be a real vtable
+    }
+
+    VTableInfo info;
+    info.vtableAddress = base + static_cast<uint32_t>(offset);
+    info.colAddress = 0;  // no RTTI for these
+    info.className.clear();
+    info.slots = std::move(slots);
+    vtables.push_back(std::move(info));
+
+    // Skip past the vtable we just consumed so we don't re-emit overlap.
+    offset = walkOffset - 4;  // -4 because the for loop adds 4
+    ++found;
+  }
+
+  REXCODEGEN_DEBUG("VTableScanner: heuristic scan found {} candidate vtables", found);
+  return vtables;
+}
+
 std::vector<uint32_t> VTableScanner::findCompleteObjectLocators() {
   std::vector<uint32_t> cols;
 
@@ -136,37 +281,90 @@ std::optional<uint32_t> VTableScanner::findVTableForCOL(uint32_t colAddr) {
 }
 
 std::vector<uint32_t> VTableScanner::readVTableSlots(uint32_t vtableStart) {
+  // The original implementation stopped reading slots the moment it saw a
+  // NULL or non-executable dword. That's WRONG for many real-world C++
+  // vtables: abstract / unimplemented methods, padding between method
+  // groups, or alignment fillers can all show up as NULL slots in the
+  // middle of an otherwise valid vtable. Stopping early made the
+  // recompiler miss every method beyond the first NULL entry, which then
+  // didn't get its body emitted -- those slots came back as
+  // mem[vtable + N] == 0x00000000 at runtime, causing NULL bctrl crashes
+  // (the entire reason Skate 3's intro / video pipelines were broken).
+  //
+  // New strategy: walk slot-by-slot, tolerate isolated NULL entries (we
+  // record them as 0 so callers know the slot exists but is abstract),
+  // and only terminate when we see strong evidence we've left the vtable
+  // -- e.g. several non-executable slots in a row, an aligned
+  // not-a-function-pointer pattern that looks like a new RTTI structure,
+  // or running off the section. We also cap at a sane upper bound to
+  // avoid runaway scans into adjacent data.
   std::vector<uint32_t> slots;
 
-  uint32_t slotAddr = vtableStart;
+  constexpr size_t kMaxSlots = 512;          // generous upper bound
+  constexpr int kMaxConsecutiveNonExec = 3;  // tolerate isolated NULLs
 
-  while (true) {
+  uint32_t slotAddr = vtableStart;
+  int consecutiveNonExec = 0;
+
+  for (size_t slotIndex = 0; slotIndex < kMaxSlots; ++slotIndex) {
     auto funcAddr = readDword(slotAddr);
     if (!funcAddr) {
-      break;  // Can't read memory
+      break;  // Off the section
     }
 
     uint32_t addr = *funcAddr;
 
-    // Termination: null pointer
+    // Tolerate NULL entries (abstract methods / padding); record as 0 so
+    // downstream code knows the slot exists, then continue.
     if (addr == 0) {
-      break;
+      ++consecutiveNonExec;
+      if (consecutiveNonExec > kMaxConsecutiveNonExec) {
+        // Too many in a row -- we've almost certainly left the vtable.
+        // Trim the trailing zeros we just recorded.
+        while (!slots.empty() && slots.back() == 0) {
+          slots.pop_back();
+        }
+        break;
+      }
+      slots.push_back(0);
+      slotAddr += 4;
+      continue;
     }
 
-    // Termination: not executable address
-    if (!isExecutableAddress(addr)) {
-      break;
-    }
-
-    // Termination: not 4-byte aligned (PPC requirement)
+    // 4-byte aligned check (PPC instructions are 4-aligned). A misaligned
+    // entry is almost always start of an unrelated structure.
     if (addr & 0x3) {
       break;
     }
 
+    // If the address isn't executable, treat it as a possibly-NULL slot
+    // (e.g. it might point into .rdata for a sub-table). We only fully
+    // bail when several non-executable entries appear in a row.
+    if (!isExecutableAddress(addr)) {
+      ++consecutiveNonExec;
+      if (consecutiveNonExec > kMaxConsecutiveNonExec) {
+        // Trim trailing non-exec entries we recorded as 0.
+        while (!slots.empty() && slots.back() == 0) {
+          slots.pop_back();
+        }
+        break;
+      }
+      slots.push_back(0);
+      slotAddr += 4;
+      continue;
+    }
+
+    // Genuine function pointer.
+    consecutiveNonExec = 0;
     slots.push_back(addr);
     slotAddr += 4;
   }
 
+  // Trim any trailing NULLs from the result so callers don't see the
+  // sentinel padding at the end.
+  while (!slots.empty() && slots.back() == 0) {
+    slots.pop_back();
+  }
   return slots;
 }
 

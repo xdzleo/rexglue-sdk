@@ -1,0 +1,26 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/xxHash/cmake_unofficial/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/disasm/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/fmt/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/spdlog/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/snappy/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/utfcpp/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/sdl3/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/thirdparty/tracy/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/core/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/filesystem/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/ui/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/input/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/audio/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/graphics/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/system/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/kernel/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/codegen/cmake_install.cmake",
+		"C:/Users/admin/Downloads/xenia-analysis/rexglue-sdk/build/src/rexglue/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

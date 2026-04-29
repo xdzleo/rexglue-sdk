@@ -30,6 +30,7 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
+#include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
@@ -49,6 +50,75 @@ const uint32_t XAPC::kDummyKernelRoutine;
 const uint32_t XAPC::kDummyRundownRoutine;
 
 using namespace rex::literals;
+
+namespace {
+
+bool IsReadableGuestRange(memory::Memory* mem, uint32_t address, uint32_t size) {
+  if (!address || !size) {
+    return false;
+  }
+  uint32_t end = address + size - 1;
+  if (end < address) {
+    return false;
+  }
+  auto* heap = mem->LookupHeap(address);
+  if (!heap) {
+    return false;
+  }
+  return heap->QueryRangeAccess(address, end) != memory::PageAccess::kNoAccess;
+}
+
+bool IsLinkedListEntryConsistent(memory::Memory* mem, uint32_t entry_guest,
+                                 uint32_t list_head_guest) {
+  if (!entry_guest || entry_guest == list_head_guest ||
+      !IsReadableGuestRange(mem, entry_guest, sizeof(X_LIST_ENTRY))) {
+    return false;
+  }
+
+  auto* entry = mem->TranslateVirtual<X_LIST_ENTRY*>(entry_guest);
+  uint32_t front = entry->flink_ptr;
+  uint32_t back = entry->blink_ptr;
+  if (!front || !back ||
+      !IsReadableGuestRange(mem, front, sizeof(X_LIST_ENTRY)) ||
+      !IsReadableGuestRange(mem, back, sizeof(X_LIST_ENTRY))) {
+    return false;
+  }
+
+  auto* front_entry = mem->TranslateVirtual<X_LIST_ENTRY*>(front);
+  auto* back_entry = mem->TranslateVirtual<X_LIST_ENTRY*>(back);
+  return front_entry->blink_ptr == entry_guest && back_entry->flink_ptr == entry_guest;
+}
+
+bool ValidateApcQueueHead(memory::Memory* mem,
+                          util::X_TYPED_LIST<XAPC, offsetof(XAPC, list_entry)>* queue,
+                          const char* source, uint32_t thread_id) {
+  uint32_t queue_guest = mem->HostToGuestVirtual(queue);
+  uint32_t front = queue->flink_ptr;
+  uint32_t back = queue->blink_ptr;
+
+  if (front == queue_guest && back == queue_guest) {
+    return false;
+  }
+
+  if (!front || !back ||
+      !IsLinkedListEntryConsistent(mem, front, queue_guest) ||
+      !IsLinkedListEntryConsistent(mem, back, queue_guest)) {
+    static std::atomic<uint32_t> corrupt_apc_log_count{0};
+    uint32_t log_index = corrupt_apc_log_count.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 32) {
+      REXSYS_WARN(
+          "{}: corrupt user APC queue on thid={} queue={:08X} front={:08X} back={:08X}; "
+          "dropping queued APCs",
+          source, thread_id, queue_guest, front, back);
+    }
+    util::XeInitializeListHead(queue, mem);
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
 
 uint32_t next_xthread_id_ = 0;
 
@@ -546,6 +616,26 @@ void XThread::Execute() {
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
 
+  // SKATE 3 INTRO BYPASS: if this thread has been flagged as skip
+  // (e.g. "MoviePlayer2 Decode Thread"), park it forever instead of
+  // running the broken guest start function OR exiting cleanly. We
+  // tried Exit(0) here -- but that lets WaitForSingleObject(thread)
+  // succeed, after which the game runs downstream code that expects
+  // populated movie state and immediately NULL+24 dereferences. By
+  // parking the thread, anything waiting on it blocks indefinitely
+  // (the title's outer state machine times the video out instead of
+  // proceeding), and the broken VP6 init code path never runs.
+  if (rex::kernel::xboxkrnl::ShouldSkipThread(thread_id_)) {
+    REXSYS_WARN(
+        "XThread::Execute: skip-flagged thread {} ('{}') -- parking forever "
+        "without running guest start function",
+        thread_id_, thread_name_);
+    kernel_state_->OnThreadExecute(this);
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(60));
+    }
+  }
+
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
@@ -700,11 +790,12 @@ void XThread::DeliverAPCs() {
   auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
   auto& user_apc_queue = kthread->apc_lists[1];
 
-  while (!user_apc_queue.empty(mem) && kthread->apc_disable_count == 0) {
+  while (kthread->apc_disable_count == 0 &&
+         ValidateApcQueueHead(mem, &user_apc_queue, "DeliverAPCs", thread_id_)) {
     PERF_counter_inc(kApcQueueDepth);
     XAPC* apc = user_apc_queue.HeadObject(mem);
     uint32_t apc_ptr = mem->HostToGuestVirtual(apc);
-    bool needs_freeing = apc->kernel_routine != XAPC::kDummyKernelRoutine;
+    bool needs_freeing = apc->kernel_routine == XAPC::kDummyKernelRoutine;
 
     util::XeRemoveEntryList(&apc->list_entry, mem);
     apc->enqueued = 0;
@@ -770,7 +861,7 @@ void XThread::RundownAPCs() {
     auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
     auto& apc_queue = kthread->apc_lists[mode];
 
-    while (!apc_queue.empty(mem)) {
+    while (ValidateApcQueueHead(mem, &apc_queue, "RundownAPCs", thread_id_)) {
       XAPC* apc = apc_queue.HeadObject(mem);
       uint32_t apc_ptr = mem->HostToGuestVirtual(apc);
       bool needs_freeing = apc->kernel_routine == XAPC::kDummyKernelRoutine;

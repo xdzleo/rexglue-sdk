@@ -1000,7 +1000,14 @@ uint32_t xeRtlNtStatusToDosError(uint32_t source_status) {
       if (!result) {
         break;
       }
-      REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError", "status=0x{:X} => 0x{:X}", status, result);
+      static thread_local uint32_t success_trace_count = 0;
+      uint32_t trace_index = success_trace_count++;
+      if (trace_index < 16) {
+        REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError", "status=0x{:X} => 0x{:X}", status, result);
+      } else if (trace_index == 16) {
+        REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError",
+                             "further successful conversion logs suppressed");
+      }
       return result;
     }
     ++error_table;
@@ -1010,13 +1017,25 @@ uint32_t xeRtlNtStatusToDosError(uint32_t source_status) {
     return status & 0xFFFF;
   }
 
-  REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError", "lookup failed for 0x{:X}", status);
+  static thread_local uint32_t failure_trace_count = 0;
+  uint32_t trace_index = failure_trace_count++;
+  if (trace_index < 16) {
+    REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError", "lookup failed for 0x{:X}", status);
+  } else if (trace_index == 16) {
+    REXKRNL_IMPORT_TRACE("xeRtlNtStatusToDosError", "further failed lookup logs suppressed");
+  }
   return 317;  // ERROR_MR_MID_NOT_FOUND
 }
 
 u32 RtlNtStatusToDosError_entry(u32 source_status) {
   uint32_t result = xeRtlNtStatusToDosError(source_status);
-  REXKRNL_IMPORT_TRACE("RtlNtStatusToDosError", "status={:#x} -> {}", source_status, result);
+  static thread_local uint32_t trace_count = 0;
+  uint32_t trace_index = trace_count++;
+  if (trace_index < 16) {
+    REXKRNL_IMPORT_TRACE("RtlNtStatusToDosError", "status={:#x} -> {}", source_status, result);
+  } else if (trace_index == 16) {
+    REXKRNL_IMPORT_TRACE("RtlNtStatusToDosError", "further conversion logs suppressed");
+  }
   return result;
 }
 

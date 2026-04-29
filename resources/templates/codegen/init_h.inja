@@ -221,16 +221,118 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 #define REX_CALL_FUNC(x) x(ctx, base)
 
-#define REX_LOOKUP_FUNC(x, y) \
-  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
+#define REX_LOOKUP_FUNC(x, y) rex::memory::LookupRecompiledFunction(u32(y))
+
+inline bool REX_IS_VALID_INDIRECT_TARGET(u32 target) {
+  constexpr u32 kCodeBase = static_cast<u32>(REX_CODE_BASE);
+  constexpr u32 kIndirectTargetSpan = static_cast<u32>(REX_CODE_SIZE + 0x10000ull);
+  return u32(target - kCodeBase) < kIndirectTargetSpan;
+}
+
+inline void REX_INVALID_INDIRECT_TARGET(PPCContext& ctx, u32 target) {
+  static thread_local u32 log_count = 0;
+  u32 current_log = log_count++;
+  if (current_log < 64) {
+    REXSYS_WARN("Indirect call to out-of-range guest address {:08X} (lr={:08X}); "
+                "r3={:08X} r4={:08X} r5={:08X} r8={:08X} r9={:08X} "
+                "r10={:08X} r11={:08X} r12={:08X} ctr={:08X} r31={:08X}; returning.",
+                target, ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r8.u32,
+                ctx.r9.u32, ctx.r10.u32, ctx.r11.u32, ctx.r12.u32, ctx.ctr.u32,
+                ctx.r31.u32);
+  } else if (current_log == 64) {
+    REXSYS_WARN("Further out-of-range indirect call logs suppressed on this thread.");
+  }
+  // Low guest addresses are never valid code in this recompiled image. Some
+  // callback tables use zero / small values as absent callbacks, and returning
+  // all bits set makes boolean callsites spin forever after the publisher logo.
+  switch (static_cast<u32>(ctx.lr)) {
+    case 0x826B999C:
+    case 0x826B9B14:
+    case 0x826B9B24:
+    case 0x8247EAB8:
+    case 0x826B56D0:
+    case 0x82F27268:
+    case 0x8277ADE8:
+    case 0x8277AE18:
+    case 0x8277AFD0:
+
+    // Skate 3 post-language-menu callsites where the recompiler couldn't
+    // populate the vtable slot. Force r3=0 so the recompiled body sees a
+    // clean "no data / null pointer" reply and continues without
+    // dereferencing garbage. These are the cascading callsites identified
+    // empirically by hitting them at runtime.
+    case 0x828E3F68:  // sub_828E3F30 vtable[96]
+    case 0x828E3F88:  // sub_828E3F30 vtable[100]
+    case 0x82F02544:  // sub_82F02368 vtable[40]
+    case 0x82F02564:  // sub_82F02368 vtable[20]
+    case 0x82F02424:  // sub_82F010B0 inner bctrl
+    case 0x82F02510:  // sub_82F02368 inner bctrl
+    case 0x8276BD30:  // RenderWare resource loader
+    case 0x82945AC4:  // input/menu state poll
+    case 0x82B69BE0:  // unknown loop exit
+    case 0x8293F364:  // unknown loop exit
+    case 0x8293F30C:  // sub_8293F0E8 vtable[28]
+    case 0x8293F320:  // sub_8293F0E8 vtable[68]
+    case 0x8293F2F8:  // sub_8293F0E8 inner
+    case 0x828F6B2C:  // late-game NULL bctrl
+    case 0x828F4A30:  // late-game NULL bctrl
+    case 0x82775E64:  // late-game NULL bctrl
+    case 0x82775E50:  // late-game NULL bctrl
+    case 0x8276E24C:  // late-game NULL bctrl
+    case 0x8276E238:  // late-game NULL bctrl
+    case 0x82EBCA98:  // linked-list iteration calling NULL vtable[8]
+    case 0x82EB3D30:  // late-game NULL bctrl
+
+    // Skate 3 post-VP6 video shutdown cascade (XexLoader/streamer teardown)
+    case 0x82EE2B2C:
+    case 0x82EE2C6C:
+    case 0x82EE3858:
+    case 0x82EE3870:
+    case 0x82EE38E8:
+    case 0x82EE3910:
+    case 0x82EE394C:
+    case 0x82F000A0:
+    case 0x82F000C0:
+
+      ctx.r3.u64 = 0;
+      return;
+    default:
+      break;
+  }
+  ctx.r3.u64 = target < 0x10000 ? 0 : UINT64_MAX;
+}
 
 #ifdef REXGLUE_ENABLE_PROFILING
-#define REX_CALL_INDIRECT_FUNC(x) \
-  PROFILE_FUNCTION_DISPATCHED();  \
-  REX_LOOKUP_FUNC(base, x)(ctx, base);
+#define REX_CALL_INDIRECT_FUNC(x)        \
+  do {                                   \
+    u32 target_ = u32(x);                \
+    if (REX_IS_VALID_INDIRECT_TARGET(target_)) {      \
+      PROFILE_FUNCTION_DISPATCHED();     \
+      PPCFunc* func_ = REX_LOOKUP_FUNC(base, target_); \
+      if (func_) {                       \
+        func_(ctx, base);                \
+      } else {                           \
+        REX_INVALID_INDIRECT_TARGET(ctx, target_);    \
+      }                                  \
+    } else {                             \
+      REX_INVALID_INDIRECT_TARGET(ctx, target_);      \
+    }                                    \
+  } while (0)
 #else
-#define REX_CALL_INDIRECT_FUNC(x) \
-  REX_LOOKUP_FUNC(base, x)(ctx, base);
+#define REX_CALL_INDIRECT_FUNC(x)        \
+  do {                                   \
+    u32 target_ = u32(x);                \
+    if (REX_IS_VALID_INDIRECT_TARGET(target_)) {      \
+      PPCFunc* func_ = REX_LOOKUP_FUNC(base, target_); \
+      if (func_) {                       \
+        func_(ctx, base);                \
+      } else {                           \
+        REX_INVALID_INDIRECT_TARGET(ctx, target_);    \
+      }                                  \
+    } else {                             \
+      REX_INVALID_INDIRECT_TARGET(ctx, target_);      \
+    }                                    \
+  } while (0)
 #endif
 
 //=============================================================================
@@ -283,7 +385,15 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
     }
     case 0:
     case 22:
-      REXCPU_WARN("tw/td trap hit (type {})", trap_type);
+      {
+        static thread_local u32 trap_log_count = 0;
+        u32 current_log = trap_log_count++;
+        if (current_log < 16) {
+          REXCPU_WARN("tw/td trap hit (type {})", trap_type);
+        } else if (current_log == 16) {
+          REXCPU_WARN("Further tw/td trap logs suppressed on this thread.");
+        }
+      }
       break;
     case 25:
       break;

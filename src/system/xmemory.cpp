@@ -76,6 +76,10 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
 
 static memory::Memory* active_memory_ = nullptr;
 
+PPCFunc* LookupRecompiledFunction(uint32_t guest_address) {
+  return active_memory_ ? active_memory_->GetFunction(guest_address) : nullptr;
+}
+
 void CrashDump() {
   static std::atomic<int> in_crash_dump(0);
   if (in_crash_dump.fetch_add(1)) {
@@ -185,6 +189,59 @@ bool Memory::Initialize() {
                               !REXCVAR_GET(protect_zero)
                                   ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
                                   : memory::kMemoryProtectNoAccess);
+  // When protect_zero is disabled (typical for titles like Skate 3 that store
+  // static data at addresses below 64 KB), commit the host pages too so the
+  // RW protection on the heap entry actually has backing memory.
+  if (!REXCVAR_GET(protect_zero)) {
+    rex::memory::AllocFixed(virtual_membase_, 0x10000,
+                            rex::memory::AllocationType::kCommit,
+                            rex::memory::PageAccess::kReadWrite);
+  }
+
+  // Pre-commit a chunk of low user-virtual memory (0x10000 - 0x40000) so that
+  // titles which compute hard-coded static-data pointers in the 64KB-256KB
+  // range (Skate 3 / RenderWare callers do `lis r,1; addi r,r,offset`)
+  // don't fault on first access. We only RESERVE+COMMIT 192KB total which is
+  // small enough not to perturb games that don't use this region. If a game
+  // later tries to NtAllocateVirtualMemory in this range it'll see the
+  // pages as already committed which matches Xbox 360 kernel behaviour where
+  // user-mode static-data pages are pre-mapped by the loader.
+  heaps_.v00000000.AllocFixed(0x00010000, 0x00030000, 0x1000,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+  // The heap above only tracks the allocation; we must also commit the
+  // underlying host pages explicitly (mirrors what the GPU writeback init
+  // does for the physical heap below).
+  rex::memory::AllocFixed(virtual_membase_ + 0x00010000, 0x00030000,
+                          rex::memory::AllocationType::kCommit,
+                          rex::memory::PageAccess::kReadWrite);
+
+  // Pre-commit a large slab of low user-virtual memory (0x40000 - 0x10000000,
+  // ~256 MB) so EA/RenderWare titles that compute hard-coded heap pointers
+  // in this range (Skate 3's audio pipeline reads from 0x30000000-0x40000000
+  // which mostly lives in kernel-data territory) don't fault on uninitialized
+  // reads. We commit the host pages once at startup -- Windows page tables
+  // handle the rest, and committed-but-zero memory is functionally equivalent
+  // to "address arrived here" for most uninitialized-pointer scenarios.
+  // Without this pre-commit, Skate 3 crashes the first time the audio worker
+  // dereferences a stale pointer in the recompiled XMA decoder code.
+  heaps_.v00000000.AllocFixed(0x00040000, 0x10000000 - 0x40000, 0x1000,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+  rex::memory::AllocFixed(virtual_membase_ + 0x00040000, 0x10000000 - 0x40000,
+                          rex::memory::AllocationType::kCommit,
+                          rex::memory::PageAccess::kReadWrite);
+
+  // Same idea for the v40000000 heap (0x40000000-0x7F000000): pre-commit the
+  // bottom 64 MB so Skate 3's runtime allocator (which carves chunks here)
+  // doesn't have to touch every page through NtAllocateVirtualMemory before
+  // the recompiled code reads from offsets inside.
+  heaps_.v40000000.AllocFixed(0x40000000, 0x04000000, 0x10000,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+  rex::memory::AllocFixed(virtual_membase_ + 0x40000000, 0x04000000,
+                          rex::memory::AllocationType::kCommit,
+                          rex::memory::PageAccess::kReadWrite);
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
 
@@ -451,19 +508,102 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
 
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      void* host_address, bool is_write) {
+  auto heap_type_name = [](memory::HeapType heap_type) {
+    switch (heap_type) {
+      case memory::HeapType::kGuestVirtual:
+        return "virtual";
+      case memory::HeapType::kGuestXex:
+        return "xex";
+      case memory::HeapType::kGuestPhysical:
+        return "physical";
+      case memory::HeapType::kHostPhysical:
+        return "host-physical";
+      default:
+        return "unknown";
+    }
+  };
+
   // Access via physical_membase_ is special, when need to bypass everything
   // (for instance, for a data provider to actually write the data) so only
   // triggering callbacks on virtual memory regions.
   if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(virtual_membase_) ||
       reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(physical_membase_)) {
+    REXSYS_ERROR("Unhandled host AV outside guest virtual mapping: host={:016X} (write={})",
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_address)), is_write);
     return false;
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap) {
+    REXSYS_ERROR("Unhandled guest AV with no heap: guest={:08X} host={:016X} (write={})",
+                 virtual_address,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_address)), is_write);
     return false;
   }
+
+  // Auto-commit recovery path. Some titles (Skate 3 / RenderWare engine
+  // internals) compute pointers into guest virtual or XEX alias ranges from
+  // data structures whose state we can't fully reconstruct. The first access
+  // lands on a page that was never NtAllocateVirtualMemory'd, and without this
+  // recovery we'd hard-SEGV the host. To keep the engine alive we commit the
+  // page on demand; it appears as zero-filled memory, which matches the
+  // semantics of a freshly-touched .bss/.data slot in most cases. The cost is
+  // that genuine null-pointer / wild-pointer reads in the recompiled code now
+  // silently succeed instead of crashing -- an acceptable trade because we'd
+  // already had to disable the 0..0x10000 NULL guard for Skate 3 to boot at
+  // all. The page count stays bounded because pages are only ever committed,
+  // never reserved.
+  //
+  // The same handler also covers kGuestPhysical: Skate 3 / RenderWare writes
+  // to GPU physical memory
+  // addresses (0xA0000000-0xBFFFFFFF range) at offsets that aren't covered
+  // by the explicit MmAllocatePhysicalMemoryEx allocations the game makes
+  // -- the engine treats the whole vA0000000 alias as a flat command-buffer
+  // / writeback area and pokes any offset on demand. Without this, the
+  // first such poke triggers a SEGV inside the recompiled code that SEH
+  // re-fires every frame, generating thousands of duplicated first-chance
+  // exceptions and wasting the CPU. We commit the host page on the
+  // exception path so the next attempt succeeds; for kGuestPhysical we
+  // also keep going through the existing TriggerCallbacks path below in
+  // case there's a watch handler that wants to see the write.
+  bool auto_committed_physical_page = false;
+  if (heap->heap_type() == memory::HeapType::kGuestVirtual ||
+      heap->heap_type() == memory::HeapType::kGuestXex ||
+      heap->heap_type() == memory::HeapType::kGuestPhysical) {
+    size_t host_page_size = rex::memory::page_size();
+    uintptr_t page_base =
+        reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+    if (rex::memory::AllocFixed(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::AllocationType::kCommit,
+                                rex::memory::PageAccess::kReadWrite)) {
+      static thread_local int s_log_count = 0;
+      if (s_log_count < 32) {
+        s_log_count++;
+        REXSYS_WARN(
+            "Auto-committed guest {} page on demand: guest={:08X} host={:016X} (write={})",
+            heap->heap_type() == memory::HeapType::kGuestPhysical
+                ? "physical"
+                : (heap->heap_type() == memory::HeapType::kGuestXex ? "xex" : "virtual"),
+            virtual_address, static_cast<uint64_t>(page_base), is_write);
+      }
+      // For physical heap, fall through to TriggerCallbacks below so any
+      // GPU coherency tracking still fires. For virtual and XEX heaps, we're
+      // done.
+      if (heap->heap_type() != memory::HeapType::kGuestPhysical) {
+        return true;
+      }
+      // Physical reads/writes may still need GPU/data-provider callbacks, but
+      // if no callback consumes the fault the new host page is already valid.
+      auto_committed_physical_page = true;
+    } else {
+      REXSYS_ERROR("Failed to auto-commit guest page at guest={:08X}", virtual_address);
+    }
+  }
+
   if (heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    REXSYS_ERROR("Unhandled guest {} AV: guest={:08X} host={:016X} (write={})",
+                 heap_type_name(heap->heap_type()), virtual_address,
+                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_address)), is_write);
     return false;
   }
 
@@ -475,6 +615,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
+    return true;
+  }
+  if (auto_committed_physical_page) {
     return true;
   }
 
@@ -701,6 +844,100 @@ bool Memory::Restore(stream::ByteStream* stream) {
 // Recompiled Code Function Table
 //=============================================================================
 
+namespace {
+
+// Fallback handler installed at every empty function table slot. When the
+// recompiled code does an indirect call (REX_CALL_INDIRECT_FUNC) to a guest
+// address that wasn't registered as a function entry (e.g. mid-function
+// addresses stored as SEH unwind targets, alternate entry points, or function
+// pointers found by analysis-blind data scans), it lands here instead of
+// segfaulting on a NULL function pointer.
+//
+// The handler logs the unregistered address, then falls back to calling the
+// nearest registered function entry below it (which means the function will
+// run from its top -- not necessarily what the caller wanted, but better than
+// crashing). This buys us boot progress while we improve the analysis pass to
+// recognise these addresses up front.
+//
+// Important: this only resolves the indirect-call symptom. If the caller
+// genuinely needed a "resume mid-function" semantics (i.e. SEH unwinding),
+// the program will probably misbehave further downstream. The log line lets
+// us identify these sites for targeted analysis fixes.
+PPCFunc* g_fallback_handler = nullptr;
+Memory* g_fallback_owner = nullptr;
+
+void rex_unresolved_indirect_handler(PPCContext& ctx, uint8_t* base) {
+  // The recompiled code path was: REX_LOOKUP_FUNC(base, target)(ctx, base)
+  // where `target` is typically `ctx.ctr.u32` for `bctrl` or another GPR.
+  // We can't recover `target` from here directly, so use ctx.ctr as the most
+  // common case and fall back to lr (the return address from the bad call).
+  uint32_t target = ctx.ctr.u32;
+
+  // Recursion guard: if the nearest-fallback call hits another empty slot,
+  // we'd infinitely recurse and overflow the stack. Cap depth.
+  // Bumped to 256 because Skate 3's audio worker hits chains this deep --
+  // the XMA decode + SDL submit + worker-loop combo nests the indirect
+  // dispatch many layers down. 256 is still far below the ~64 KB stack
+  // available to thread workers.
+  static thread_local int s_depth = 0;
+  if (s_depth >= 256) {
+    REXSYS_ERROR(
+        "Indirect-call fallback recursion depth exceeded at target {:08X} "
+        "(lr={:08X}); aborting to prevent stack overflow.",
+        target, ctx.lr);
+    return;
+  }
+  s_depth++;
+  struct DepthGuard {
+    ~DepthGuard() { s_depth--; }
+  } guard;
+
+  PPCFunc* nearest = nullptr;
+  uint32_t nearest_addr = 0;
+  if (g_fallback_owner) {
+    // Walk down 4 bytes at a time looking for a registered entry.
+    // Most missing addresses are <= 256 bytes off a real entry.
+    constexpr uint32_t kMaxSearch = 0x1000;
+    for (uint32_t off = 0; off <= kMaxSearch; off += 4) {
+      if (target < off)
+        break;
+      uint32_t probe = (target - off) & ~uint32_t{3};
+      auto* fn = g_fallback_owner->GetFunction(probe);
+      if (fn && fn != g_fallback_handler) {
+        nearest = fn;
+        nearest_addr = probe;
+        break;
+      }
+    }
+  }
+
+  static thread_local uint32_t s_last_logged = 0;
+  if (s_last_logged != target) {
+    s_last_logged = target;
+    if (nearest) {
+      REXSYS_WARN(
+          "Indirect call to unregistered guest address {:08X} (lr={:08X}); "
+          "diverting to nearest entry {:08X} (offset +{}). This is a band-aid "
+          "for mid-function indirect calls (likely SEH unwind or alt entry).",
+          target, ctx.lr, nearest_addr, target - nearest_addr);
+    } else {
+      REXSYS_ERROR(
+          "Indirect call to unregistered guest address {:08X} (lr={:08X}) "
+          "with no registered function within 4KB. Cannot recover.",
+          target, ctx.lr);
+    }
+  }
+
+  if (nearest) {
+    nearest(ctx, base);
+  }
+  // If no fallback found, just return -- caller's stack will be unwound
+  // and we'll likely crash later, but at least the log line above pinpoints
+  // the bad address.
+}
+
+}  // namespace
+
 bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
                                      uint32_t image_size) {
   if (function_table_base_ != 0) {
@@ -736,8 +973,19 @@ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uin
     return false;
   }
 
-  // Zero-initialize the table (nullptr for all entries).
-  Zero(function_table_base_, table_size);
+  // Pre-fill every slot with the unresolved-indirect handler instead of leaving
+  // them NULL. SetFunction() will overwrite slots for registered functions.
+  // This converts "indirect call to unregistered address" from a hard SEGV
+  // into a logged warning + nearest-function fallback (see handler comment).
+  g_fallback_handler = &rex_unresolved_indirect_handler;
+  g_fallback_owner = this;
+  size_t slot_count = table_size / sizeof(PPCFunc*);
+  function_table_slots_.assign(slot_count, g_fallback_handler);
+
+  auto* slots = TranslateVirtual<PPCFunc**>(function_table_base_);
+  for (size_t i = 0; i < slot_count; ++i) {
+    slots[i] = g_fallback_handler;
+  }
 
   return true;
 }
@@ -762,10 +1010,16 @@ void Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
   // Calculate table offset: (guest_addr - code_base) * 2
   // This gives us the byte offset into the table for this 8-byte slot.
   uint64_t offset = (uint64_t(guest_address) - function_code_base_) * 2;
+  size_t slot_index = (guest_address - function_code_base_) >> 2;
+  if (slot_index < function_table_slots_.size()) {
+    function_table_slots_[slot_index] = host_function;
+  }
+
   uint32_t table_address = function_table_base_ + uint32_t(offset);
 
-  // Write the host function pointer to the table.
-  // The table is in guest memory but stores host pointers.
+  // Keep a guest-memory mirror for diagnostics/backward compatibility. The
+  // generated indirect-call path resolves through function_table_slots_
+  // instead because this mirror is writable by guest code.
   auto* slot = TranslateVirtual<PPCFunc**>(table_address);
   *slot = host_function;
 }
@@ -781,13 +1035,11 @@ PPCFunc* Memory::GetFunction(uint32_t guest_address) const {
     return nullptr;
   }
 
-  // Calculate table offset
-  uint64_t offset = (uint64_t(guest_address) - function_code_base_) * 2;
-  uint32_t table_address = function_table_base_ + uint32_t(offset);
-
-  // Read the host function pointer from the table.
-  auto* slot = const_cast<memory::Memory*>(this)->TranslateVirtual<PPCFunc**>(table_address);
-  return *slot;
+  size_t slot_index = (guest_address - function_code_base_) >> 2;
+  if (slot_index < function_table_slots_.size()) {
+    return function_table_slots_[slot_index];
+  }
+  return nullptr;
 }
 
 rex::memory::PageAccess ToPageAccess(uint32_t protect) {

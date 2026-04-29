@@ -263,7 +263,13 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
     }
     default:
       if (!register_file_.GetRegisterInfo(r)) {
-        REXGPU_DEBUG("GPU: Read from unknown register ({:04X})", r);
+        static thread_local uint32_t unknown_read_log_count = 0;
+        uint32_t log_index = unknown_read_log_count++;
+        if (log_index < 64) {
+          REXGPU_DEBUG("GPU: Read from unknown register ({:04X})", r);
+        } else if (log_index == 64) {
+          REXGPU_DEBUG("GPU: further unknown register read logs suppressed");
+        }
       }
   }
 
@@ -281,7 +287,13 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
     default:
-      REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+      static thread_local uint32_t unknown_write_log_count = 0;
+      uint32_t log_index = unknown_write_log_count++;
+      if (log_index < 64) {
+        REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+      } else if (log_index == 64) {
+        REXGPU_WARN("Further unknown GPU register write logs suppressed");
+      }
       break;
   }
 

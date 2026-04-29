@@ -43,6 +43,11 @@ constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
 
 namespace rex::memory {
 
+// Resolve a recompiled guest function address through the host-owned dispatch
+// table. Recompiled code uses this for indirect calls; unlike the guest memory
+// mirror, this table can't be overwritten by guest writes.
+PPCFunc* LookupRecompiledFunction(uint32_t guest_address);
+
 /// Lightweight guest-to-host pointer translation using the memory base.
 /// For hooks and kernel code operating with the base pointer directly.
 /// Same raw arithmetic as recompiled code; no Memory* or heap lookup needed.
@@ -553,6 +558,7 @@ class Memory {
   uint32_t function_code_base_ = 0;   // CODE_BASE for offset calculation
   uint32_t function_code_size_ = 0;   // CODE_SIZE for bounds checking
   uint32_t function_thunk_reserve_ = 0;  // Extra space reserved for runtime thunks
+  std::vector<PPCFunc*> function_table_slots_;
 
   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
   uint8_t* mapping_base_ = nullptr;

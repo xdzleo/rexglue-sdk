@@ -48,10 +48,12 @@ VoidResult validateGraph(CodegenContext& ctx) {
   auto& graph = ctx.graph;
   auto& binary = ctx.binary();
   auto& errors = ctx.errors;
+  const bool allowUnresolved = ctx.Config().allowUnresolvedCalls;
 
   size_t functionsChecked = 0;
   size_t callsChecked = 0;
   size_t edgesVerified = 0;
+  size_t unresolvedDowngraded = 0;
 
   for (const auto& [addr, node] : graph.functions()) {
     functionsChecked++;
@@ -110,10 +112,18 @@ VoidResult validateGraph(CodegenContext& ctx) {
           }
 
           if (!targetExists) {
-            // Target is not in any function - this is an error that must stop the build
-            errors.Add(AnalysisErrors::Category::UnresolvedCall, target, site,
-                       fmt::format("{} 0x{:08X} from 0x{:08X} - target not in any function",
-                                   isCall ? "bl" : "b", target, site));
+            // Target is not in any function. With allow_unresolved_calls=true the
+            // code emitter (build_b / build_bl) will plant a REX_FATAL trap so we can
+            // still ship a binary; downgrade to a warning instead of stopping the build.
+            auto msg =
+                fmt::format("{} 0x{:08X} from 0x{:08X} - target not in any function",
+                            isCall ? "bl" : "b", target, site);
+            if (allowUnresolved) {
+              REXCODEGEN_WARN("Analyze: unresolved {} (will emit REX_FATAL trap)", msg);
+              unresolvedDowngraded++;
+            } else {
+              errors.Add(AnalysisErrors::Category::UnresolvedCall, target, site, msg);
+            }
             continue;
           }
 
@@ -125,9 +135,15 @@ VoidResult validateGraph(CodegenContext& ctx) {
               const FunctionNode* containingFunc = graph.getFunctionContaining(target);
               if (!containingFunc) {
                 // Target is not in any function - this is an error (call the cops)
-                errors.Add(AnalysisErrors::Category::UnresolvedCall, target, site,
-                           fmt::format("{} 0x{:08X} from 0x{:08X} in {} - no CallEdge recorded",
-                                       isCall ? "bl" : "b", target, site, node->name()));
+                auto msg =
+                    fmt::format("{} 0x{:08X} from 0x{:08X} in {} - no CallEdge recorded",
+                                isCall ? "bl" : "b", target, site, node->name());
+                if (allowUnresolved) {
+                  REXCODEGEN_WARN("Analyze: unresolved {} (will emit REX_FATAL trap)", msg);
+                  unresolvedDowngraded++;
+                } else {
+                  errors.Add(AnalysisErrors::Category::UnresolvedCall, target, site, msg);
+                }
               }
               // If target is inside another function, it will be handled as a tail call
               // to that function's internal label during code generation
@@ -142,6 +158,12 @@ VoidResult validateGraph(CodegenContext& ctx) {
 
   REXCODEGEN_INFO("Analyze: checked {} branches in {} functions, verified {} edges", callsChecked,
                   functionsChecked, edgesVerified);
+  if (unresolvedDowngraded > 0) {
+    REXCODEGEN_WARN(
+        "Analyze: {} unresolved branches downgraded to warnings (allow_unresolved_calls=true). "
+        "Generated code will REX_FATAL if these sites execute at runtime.",
+        unresolvedDowngraded);
+  }
 
   if (errors.HasErrors()) {
     REXCODEGEN_ERROR("Analyze: found {} errors", errors.Count());

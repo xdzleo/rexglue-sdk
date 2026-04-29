@@ -181,6 +181,21 @@ u32 NtResumeThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
   auto thread = REX_KERNEL_OBJECTS()->LookupObject<XThread>(handle);
   if (thread) {
     REXKRNL_TRACE("[NtResumeThread] handle={:08X} thread={}", uint32_t(handle), thread->name());
+
+    // SKATE 3 INTRO BYPASS: skip-flagged threads (e.g. "MoviePlayer2 Decode
+    // Thread") still get resumed -- but XThread::Execute() will see the
+    // skip flag and call Exit(0) immediately without running the broken
+    // guest start function. We DO want to resume here so the thread
+    // actually runs to completion (and signals waiters via the normal
+    // exit path) instead of getting stuck in a suspended state that
+    // leaves downstream callers dereferencing NULL+0x18.
+    if (ShouldSkipThread(thread->thread_id())) {
+      REXKRNL_WARN(
+          "[NtResumeThread] resuming skip-flagged thread {} ({}) "
+          "-- it will exit cleanly via XThread::Execute short-circuit",
+          thread->thread_id(), thread->name());
+    }
+
     result = thread->Resume(&suspend_count);
   } else {
     REXKRNL_WARN("[NtResumeThread] handle={:08X} NOT FOUND", uint32_t(handle));
@@ -199,6 +214,17 @@ u32 KeResumeThread_entry(mapped_void thread_ptr) {
   if (thread) {
     REXKRNL_TRACE("[KeResumeThread] ptr={:08X} thread={}", thread_ptr.guest_address(),
                   thread->name());
+
+    // SKATE 3 INTRO BYPASS: skip-flagged threads still get resumed; the
+    // skip is enforced inside XThread::Execute() by short-circuiting to
+    // a clean Exit(0). See comment in NtResumeThread_entry.
+    if (ShouldSkipThread(thread->thread_id())) {
+      REXKRNL_WARN(
+          "[KeResumeThread] resuming skip-flagged thread {} ({}) "
+          "-- it will exit cleanly via XThread::Execute short-circuit",
+          thread->thread_id(), thread->name());
+    }
+
     result = thread->Resume();
   } else {
     REXKRNL_WARN("[KeResumeThread] ptr={:08X} NOT FOUND", thread_ptr.guest_address());
@@ -1017,7 +1043,26 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
     apc->arg1 = arg1;
     apc->arg2 = arg2;
 
-    auto& which_list = target_thread->apc_lists[apc->apc_mode];
+    uint32_t apc_mode = apc->apc_mode;
+    if (apc_mode > 1) {
+      result = 0;
+      xeKeKfReleaseSpinLock(ctx, &target_thread->apc_lock, old_irql);
+      return result;
+    }
+
+    auto& which_list = target_thread->apc_lists[apc_mode];
+    if (!which_list.flink_ptr || !which_list.blink_ptr) {
+      static std::atomic<uint32_t> repaired_apc_list_log_count{0};
+      uint32_t log_index = repaired_apc_list_log_count.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 32) {
+        REXSYS_WARN(
+            "KeInsertQueueApc: repairing uninitialized APC list thread={:08X} mode={} "
+            "flink={:08X} blink={:08X}",
+            thread_guest_pointer, apc_mode, uint32_t(which_list.flink_ptr),
+            uint32_t(which_list.blink_ptr));
+      }
+      util::XeInitializeListHead(&which_list, mem);
+    }
 
     if (apc->normal_routine) {
       which_list.InsertTail(apc, mem);

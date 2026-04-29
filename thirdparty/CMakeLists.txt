@@ -564,6 +564,22 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/fft_float.c
     ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
+    # VP6 decoder + dependencies (h264chroma, hpeldsp, huffman, videodsp, vp3dsp, vp56dsp)
+    ${FFMPEG_DIR}/libavcodec/vp6.c
+    ${FFMPEG_DIR}/libavcodec/vp56.c
+    ${FFMPEG_DIR}/libavcodec/vp56data.c
+    ${FFMPEG_DIR}/libavcodec/vp56dsp.c
+    ${FFMPEG_DIR}/libavcodec/vp56rac.c
+    ${FFMPEG_DIR}/libavcodec/vp6dsp.c
+    ${FFMPEG_DIR}/libavcodec/h264chroma.c
+    ${FFMPEG_DIR}/libavcodec/hpeldsp.c
+    ${FFMPEG_DIR}/libavcodec/huffman.c
+    ${FFMPEG_DIR}/libavcodec/videodsp.c
+    ${FFMPEG_DIR}/libavcodec/vp3dsp.c
+    # X86 SIMD init stubs for VP6 path (the .asm kernels aren't compiled
+    # because we don't have NASM/yasm in this build pipeline; these stubs
+    # let the C decoder fall back to portable kernels).
+    ${FFMPEG_OVERLAY_SRC_DIR}/vp6_x86_init_stubs.c
 )
 
 # Windows-specific source

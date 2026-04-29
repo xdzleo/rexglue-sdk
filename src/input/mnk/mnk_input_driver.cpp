@@ -115,13 +115,30 @@ static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_v
 X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                          X_INPUT_CAPABILITIES* out_caps) {
   if (!IsEnabled() || user_index != UserIndex()) {
+    static thread_local int s_warn_count = 0;
+    if (s_warn_count < 4) {
+      s_warn_count++;
+      REXLOG_WARN(
+          "MnK GetCapabilities: returning DEVICE_NOT_CONNECTED for user={} "
+          "(IsEnabled={}, UserIndex={}, mnk_mode_cvar={})",
+          user_index, IsEnabled(), UserIndex(), REXCVAR_GET(mnk_mode));
+    }
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  static thread_local int s_ok_count = 0;
+  if (s_ok_count < 4) {
+    s_ok_count++;
+    REXLOG_INFO(
+        "MnK GetCapabilities: SUCCESS for user={} (mnk_mode={}, has_focus={}, is_active={})",
+        user_index, REXCVAR_GET(mnk_mode), has_focus_, is_active());
   }
   if (out_caps) {
     std::memset(out_caps, 0, sizeof(*out_caps));
     out_caps->type = 0x01;
-    out_caps->sub_type = 0x01;
-    out_caps->flags = 0;
+    // Match the synth/NOP fixes: Skate 3 / EA RenderWare gate input on
+    // sub_type==2 and flags bit 0 set.
+    out_caps->sub_type = 0x02;
+    out_caps->flags = 0x0003;  // bit 0 + bit 1 (Skate 3 / RenderWare gate)
     out_caps->gamepad.buttons = 0xFFFF;
     out_caps->gamepad.left_trigger = 0xFF;
     out_caps->gamepad.right_trigger = 0xFF;
@@ -306,10 +323,16 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  static int log_count = 0;
+  if (log_count < 30) {
+    log_count++;
+    REXLOG_INFO("[MnK] OnKeyDown vk=0x{:X} IsEnabled={} has_focus={}", vk, IsEnabled(),
+                has_focus_);
+  }
   if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
-  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   SetKeyState(vk, true);
 }
 

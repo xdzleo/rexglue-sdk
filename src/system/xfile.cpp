@@ -19,9 +19,37 @@
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
 
+#include <atomic>
+#include <cctype>
 #include <span>
 
 namespace rex::system {
+
+static bool ContainsAsciiCaseInsensitive(std::string_view value, std::string_view needle) {
+  if (needle.empty() || value.size() < needle.size()) {
+    return false;
+  }
+  for (size_t i = 0; i <= value.size() - needle.size(); ++i) {
+    bool matched = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      unsigned char a = static_cast<unsigned char>(value[i + j]);
+      unsigned char b = static_cast<unsigned char>(needle[j]);
+      if (std::tolower(a) != std::tolower(b)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsVideoIoPath(std::string_view path) {
+  return ContainsAsciiCaseInsensitive(path, "movies") ||
+         ContainsAsciiCaseInsensitive(path, ".vp6");
+}
 
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
@@ -184,6 +212,19 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     *out_bytes_read = uint32_t(bytes_read);
   }
 
+  if (IsVideoIoPath(path()) || IsVideoIoPath(name())) {
+    static std::atomic<uint32_t> video_read_logs{0};
+    uint32_t log_index = video_read_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 160 || (log_index % 256) == 0 || XFAILED(result)) {
+      REXLOG_INFO("[VIDEO_IO] XFile::Read #{} file='{}' buf={:08X} len={} off={} "
+                  "result={:08X} bytes={} pos={} notify={}",
+                  log_index + 1, path(), static_cast<uint32_t>(buffer_guest_address),
+                  static_cast<uint32_t>(buffer_length), static_cast<uint64_t>(byte_offset),
+                  static_cast<uint32_t>(result), static_cast<uint32_t>(bytes_read),
+                  static_cast<uint64_t>(position_), notify_completion ? 1 : 0);
+    }
+  }
+
   if (notify_completion) {
     XIOCompletion::IONotification notify;
     notify.apc_context = apc_context;
@@ -240,6 +281,14 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
 
   if (out_bytes_read) {
     *out_bytes_read = uint32_t(read_total);
+  }
+
+  if (IsVideoIoPath(path()) || IsVideoIoPath(name())) {
+    REXLOG_INFO("[VIDEO_IO] XFile::ReadScatter file='{}' segments={:08X} len={} off={} "
+                "result={:08X} bytes={}",
+                path(), static_cast<uint32_t>(segments_guest_address),
+                static_cast<uint32_t>(length), static_cast<uint64_t>(byte_offset),
+                static_cast<uint32_t>(result), static_cast<uint32_t>(read_total));
   }
 
   XIOCompletion::IONotification notify;

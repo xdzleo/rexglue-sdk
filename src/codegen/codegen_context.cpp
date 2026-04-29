@@ -21,6 +21,9 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xex_module.h>
 
+#include <cstdlib>
+#include <fstream>
+
 namespace rex::codegen {
 
 Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& configPath,
@@ -89,6 +92,24 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
 
   REXCODEGEN_INFO("Loaded XEX: base=0x{:08X}, size=0x{:X}, entry=0x{:08X}",
                   ctx.binary_.baseAddress(), ctx.binary_.imageSize(), ctx.binary_.entryPoint());
+
+  // DEBUG: dump each decrypted/decompressed section to disk so we can run
+  // strings/objdump/Ghidra against it. Names go through the section header
+  // sanitised filename. Triggered by the env var REXGLUE_DUMP_DECRYPTED.
+  if (const char* dump_dir = std::getenv("REXGLUE_DUMP_DECRYPTED")) {
+    for (const auto& s : ctx.binary_.sections()) {
+      std::string name(s.name);
+      for (auto& c : name) {
+        if (c == '.' || c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
+      }
+      std::string path = std::string(dump_dir) + "/skate3_" + name +
+                         "_at_" + std::to_string(s.baseAddress) + ".bin";
+      std::ofstream(path, std::ios::binary)
+          .write(reinterpret_cast<const char*>(s.data), s.size);
+      REXCODEGEN_INFO("Dumped section '{}' (0x{:08X}, 0x{:X} bytes) -> {}",
+                      s.name, s.baseAddress, s.size, path);
+    }
+  }
 
   // Initialize AnalysisState from binary
   ctx.analysisState_.format = "xex";

@@ -1934,8 +1934,32 @@ BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
               worklist.push(*target);
             }
           } else if (target) {
-            // External conditional branch (or conditional tail call to known function)
-            result.unresolvedBranches.push_back({addr, *target, false, true});
+            // Target is past funcEnd (typically a too-small PDATA size) but
+            // still inside the containing code region and NOT another function's
+            // entry point. PPC compilers (especially for big C++ functions like
+            // RenderWare engine internals) regularly emit forward conditional
+            // branches that overshoot the PDATA-declared size by hundreds of
+            // bytes. Without extending funcEnd here we'd push the target onto
+            // unresolvedBranches and the codegen would plant a REX_FATAL trap
+            // -- guaranteed crash if execution reaches it. Mirror the
+            // jump-table extension below: pull funcEnd out to cover this
+            // target, label it, and queue it on the worklist.
+            bool inSameRegion =
+                *target >= containingRegion.start && *target < containingRegion.end;
+            bool isOtherFnEntry = knownFunctions.contains(*target);
+            if (inSameRegion && !isOtherFnEntry) {
+              if (*target >= funcEnd) {
+                funcEnd = *target + 4;
+              }
+              result.labels.insert(*target);
+              if (!visited.contains(*target) && !blockStarts.contains(*target)) {
+                blockStarts.insert(*target);
+                worklist.push(*target);
+              }
+            } else {
+              // External conditional branch (or conditional tail call to known function)
+              result.unresolvedBranches.push_back({addr, *target, false, true});
+            }
           }
           // CRITICAL: Fall-through also needs a label
           uint32_t fallthrough = addr + 4;
@@ -1957,9 +1981,29 @@ BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
                 worklist.push(*target);
               }
             } else {
-              // Tail call to external
-              result.tailCalls.push_back(*target);
-              result.unresolvedBranches.push_back({addr, *target, false, false});
+              // Mirror the conditional-branch fix: if the target is past
+              // funcEnd but still inside this code region AND not another
+              // function's entry, treat it as an in-function forward jump
+              // and extend funcEnd to include it. Only fall back to
+              // tail-call treatment when the target lands in a different
+              // region or on a known function entry.
+              bool inSameRegion =
+                  *target >= containingRegion.start && *target < containingRegion.end;
+              bool isOtherFnEntry = knownFunctions.contains(*target);
+              if (inSameRegion && !isOtherFnEntry) {
+                if (*target >= funcEnd) {
+                  funcEnd = *target + 4;
+                }
+                result.labels.insert(*target);
+                if (!visited.contains(*target) && !blockStarts.contains(*target)) {
+                  blockStarts.insert(*target);
+                  worklist.push(*target);
+                }
+              } else {
+                // Tail call to external function (or out-of-region jump).
+                result.tailCalls.push_back(*target);
+                result.unresolvedBranches.push_back({addr, *target, false, false});
+              }
             }
           }
           block.size = addr - blockStart + 4;

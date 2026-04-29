@@ -798,8 +798,13 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   if (reader->read_count() < count * sizeof(uint32_t)) {
-    REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
-                 reader->read_count(), count * sizeof(uint32_t));
+    uint32_t base_index = packet & 0x7FFF;
+    uint32_t write_one_reg = (packet >> 15) & 0x1;
+    REXGPU_ERROR(
+        "ExecutePacketType0 overflow packet={:08X} base={:04X} write_one={} "
+        "read_off={:08X} write_off={:08X} read_count={:08X} packet_bytes={:08X}",
+        packet, base_index, write_one_reg, reader->read_offset(), reader->write_offset(),
+        reader->read_count(), count * sizeof(uint32_t));
     return false;
   }
 
@@ -844,6 +849,35 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+
+  // ReXGlue diagnostic: count opcodes flowing through the CP. Need to know
+  // whether the title is actually issuing draws+resolves or only init-time
+  // register sets. Emit a periodic summary every 60 packets.
+  {
+    static std::atomic<uint64_t> total_packets{0};
+    static std::atomic<uint64_t> draws{0};
+    static std::atomic<uint64_t> resolves_event_write{0};
+    static std::atomic<uint64_t> set_constant{0};
+    static std::atomic<uint64_t> swap_seen{0};
+    uint64_t n = total_packets.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (opcode == 0x22 || opcode == 0x36) {  // PM4_DRAW_INDX / PM4_DRAW_INDX_2
+      draws.fetch_add(1, std::memory_order_relaxed);
+    } else if (opcode == 0x46 || opcode == 0x47 || opcode == 0x4B) {  // EVENT_WRITE family
+      resolves_event_write.fetch_add(1, std::memory_order_relaxed);
+    } else if (opcode == 0x2D || opcode == 0x55) {  // SET_CONSTANT
+      set_constant.fetch_add(1, std::memory_order_relaxed);
+    } else if (opcode == 0x64) {  // PM4_XE_SWAP
+      swap_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (n <= 16 || (n % 1024) == 0) {
+      REXGPU_INFO(
+          "CP packet #{} opcode=0x{:02X} count={} -- totals: draws={} eventW={} setC={} swap={}",
+          n, opcode, count, draws.load(std::memory_order_relaxed),
+          resolves_event_write.load(std::memory_order_relaxed),
+          set_constant.load(std::memory_order_relaxed),
+          swap_seen.load(std::memory_order_relaxed));
+    }
+  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
@@ -1024,8 +1058,15 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
-  assert_true(reader->read_offset() ==
-              (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
+  uint32_t expected_read_offset =
+      (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity();
+  if (reader->read_offset() != expected_read_offset) {
+    REXGPU_WARN(
+        "PM4 Type3 opcode 0x{:02X} consumed wrong packet size packet={:08X} "
+        "count={} data_start={:08X} actual={:08X} expected={:08X}; realigning",
+        opcode, packet, count, data_start_offset, reader->read_offset(), expected_read_offset);
+    reader->set_read_offset(expected_read_offset);
+  }
   return result;
 }
 

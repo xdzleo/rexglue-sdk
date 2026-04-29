@@ -622,22 +622,57 @@ bool Presenter::RefreshGuestOutput(
   {
     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
     switch (paint_mode_) {
-      case PaintMode::kNone:
+      case PaintMode::kNone: {
+        static bool kNone_logged = false;
+        if (!kNone_logged) {
+          kNone_logged = true;
+          REXLOG_WARN(
+              "Presenter: paint_mode=kNone -- guest output written but never painted! "
+              "(surface_state={})",
+              int(surface_paint_connection_state_));
+        }
         // Neither painting nor window paint requesting is accessible.
         break;
-      case PaintMode::kUIThreadOnRequest:
+      }
+      case PaintMode::kUIThreadOnRequest: {
+        static bool kUIReq_logged = false;
+        if (!kUIReq_logged) {
+          kUIReq_logged = true;
+          REXLOG_INFO("Presenter: paint_mode=kUIThreadOnRequest, surface_state={}",
+                      int(surface_paint_connection_state_));
+        }
         // Only window paint requesting is accessible.
         RequestPaintOrConnectionRecoveryViaWindow(true);
         break;
-      case PaintMode::kGuestOutputThreadImmediately:
+      }
+      case PaintMode::kGuestOutputThreadImmediately: {
+        static int kImmediate_count = 0;
+        ++kImmediate_count;
+        bool log_now = kImmediate_count <= 4 || (kImmediate_count % 60) == 0;
+        if (log_now) {
+          REXLOG_INFO(
+              "Presenter: paint_mode=kImmediate #{} surface_state={} -> "
+              "{}",
+              kImmediate_count, int(surface_paint_connection_state_),
+              (surface_paint_connection_state_ ==
+               SurfacePaintConnectionState::kConnectedPaintable)
+                  ? "calling PaintAndPresent"
+                  : "skipping (not kConnectedPaintable)");
+        }
         // Both painting and window paint requesting are accessible.
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
+          if (log_now) {
+            REXLOG_INFO("Presenter: PaintAndPresent #{} returned, surface_state={} paint_result={}",
+                        kImmediate_count, int(surface_paint_connection_state_),
+                        int(paint_result));
+          }
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
         }
         break;
+      }
     }
   }
   // Handle GPU loss when not in the middle of the function anymore, and

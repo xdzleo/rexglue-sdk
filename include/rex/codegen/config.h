@@ -95,6 +95,14 @@ struct RecompilerConfig {
   uint32_t dataRegionThreshold = 16;  ///< Consecutive invalid instructions to mark as data region
   uint32_t largeFunctionThreshold = 1048576;  ///< 1MB - warn if function exceeds this size
 
+  /// When true, unresolved branch/call targets are downgraded from errors to warnings
+  /// so that codegen can still produce output. The emitted code embeds REX_FATAL traps
+  /// (see build_b/build_bl) at the unresolved sites; these only fire if execution
+  /// actually reaches them at runtime. Useful for large/complex titles where a
+  /// handful of branches land in regions analysis failed to cover -- enabling this
+  /// lets the rest of the binary build while you triage by playing the game.
+  bool allowUnresolvedCalls = false;
+
   // === Manual overrides ===
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
   std::unordered_map<uint32_t, JumpTable> switchTables;

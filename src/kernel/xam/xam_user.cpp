@@ -36,6 +36,16 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+constexpr uint32_t kXUserIndexAny = 0xFF;
+
+bool IsLocalOrAnyUserIndex(uint32_t user_index) {
+  return user_index < 4 || user_index == kXUserIndexAny;
+}
+
+uint32_t NormalizeProfileUserIndex(uint32_t user_index) {
+  return IsLocalOrAnyUserIndex(user_index) ? 0 : user_index;
+}
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
               type_mask == 7);
@@ -44,19 +54,17 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   }
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      auto type = user_profile->type() & type_mask;
-      if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      } else if (type & 1) {
-        // maybe offline profile?
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      }
+  if (IsLocalOrAnyUserIndex(user_index)) {
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    auto type = user_profile->type() & type_mask;
+    if (type & (2 | 4)) {
+      // maybe online profile?
+      xuid = user_profile->xuid();
+      result = X_E_SUCCESS;
+    } else if (type & 1) {
+      // maybe offline profile?
+      xuid = user_profile->xuid();
+      result = X_E_SUCCESS;
     }
   } else {
     result = X_E_INVALIDARG;
@@ -66,14 +74,19 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
-  uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-    }
+  // Return signin_state=1 (signed-in offline) for all 4 user slots so EA
+  // RenderWare titles (Skate 3) that gate their main-loop input handling
+  // behind "is the active user signed in?" checks see a consistent state
+  // for the whole party. Previously only user 0 returned 1 and users 1-3
+  // returned 0 -- some titles interpret "any user disconnected" as "freeze
+  // input pipeline" and stop processing controller events from the active
+  // user. UnleashedRecomp / LibertyRecomp solve this by overriding the
+  // entire XamUser layer; we keep the rexglue impl but return signed-in
+  // for all slots.
+  if (IsLocalOrAnyUserIndex(user_index)) {
+    return 1;  // signed-in offline
   }
-  return signin_state;
+  return 0;
 }
 
 typedef struct {
@@ -92,24 +105,20 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
+  info->signin_state = 1;
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
-  if (user_index >= 4) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_E_INVALIDARG;
-  }
-
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -119,12 +128,8 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
 }
 
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
-  if (user_index >= 4) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_E_INVALIDARG;
-  }
-
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
   }
 
   if (!buffer || buffer_len < 16) {
@@ -208,6 +213,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
 
+  const uint32_t original_user_index = user_index;
+  if (!xuids) {
+    user_index = NormalizeProfileUserIndex(user_index);
+  }
+
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
@@ -219,6 +229,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_NO_SUCH_USER;
+  }
+
+  if (original_user_index != user_index) {
+    REXKRNL_TRACE("XamUserReadProfileSettings: remapped user_index=0x{:X} to user_index={}",
+                  original_user_index, user_index);
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -308,6 +323,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  user_index = NormalizeProfileUserIndex(user_index);
   if (user_index) {
     // Only support user 0.
     if (overlapped) {
@@ -376,10 +392,6 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     if (user_index >= 4) {
       return X_ERROR_INVALID_PARAMETER;
     }
-
-    if (user_index) {
-      return X_ERROR_NO_SUCH_USER;
-    }
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
@@ -388,7 +400,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -399,7 +411,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -427,11 +439,8 @@ u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
-  if (user_index >= 4) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     return X_ERROR_INVALID_PARAMETER;
-  }
-  if (user_index) {
-    return X_ERROR_NO_SUCH_USER;
   }
   return 6 /* 6 appears to be Gold */;
 }
@@ -441,21 +450,16 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   uint32_t are_friends = 0;
   X_RESULT result;
 
-  if (user_index >= 4) {
+  if (!IsLocalOrAnyUserIndex(user_index)) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      if (user_profile->signin_state() == 0) {
-        result = X_ERROR_NOT_LOGGED_ON;
-      } else {
-        // No friends!
-        are_friends = 0;
-        result = X_ERROR_SUCCESS;
-      }
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (user_profile->signin_state() == 0) {
+      result = X_ERROR_NOT_LOGGED_ON;
     } else {
-      // Only support user 0.
-      result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
+      // No friends!
+      are_friends = 0;
+      result = X_ERROR_SUCCESS;
     }
   }
 

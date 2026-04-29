@@ -35,6 +35,9 @@ namespace rex::codegen {
 
 namespace {
 
+// Forward declaration -- defined later in this file.
+void functionPointerScan(CodegenContext& ctx);
+
 //=============================================================================
 // Discover Phase: iterative function block discovery
 //=============================================================================
@@ -225,12 +228,35 @@ void discoverAllFunctions(CodegenContext& ctx) {
     VTableScanner vtScanner(binary);
     auto vtables = vtScanner.scan();
 
+    // RTTI-stripped binaries (most retail Xbox 360 EA RenderWare titles)
+    // hand back zero vtables from the COL-based scanner. Fall back to a
+    // heuristic .rdata scan in that case so we still discover the methods
+    // hung off vtables -- otherwise every indirect bctrl in the recompiled
+    // game finds a NULL slot at runtime and either bails out (if the
+    // runtime catches it) or crashes the host. This also lets the
+    // heuristic find any vtables the RTTI scanner happened to miss.
+    if (vtables.empty()) {
+      vtables = vtScanner.scanHeuristic();
+      REXCODEGEN_INFO("Analyze: VTable RTTI scan empty; heuristic scan found {} candidates",
+                      vtables.size());
+    } else {
+      auto extra = vtScanner.scanHeuristic();
+      REXCODEGEN_DEBUG("Analyze: VTable heuristic also found {} candidates", extra.size());
+      vtables.insert(vtables.end(), std::make_move_iterator(extra.begin()),
+                     std::make_move_iterator(extra.end()));
+    }
+
     size_t newFunctions = 0;
 
     for (const auto& vt : vtables) {
       for (size_t i = 0; i < vt.slots.size(); i++) {
         uint32_t funcAddr = vt.slots[i];
 
+        // Abstract methods / padding -- the scanner now records 0 for
+        // these so positional info is preserved, but there's nothing to
+        // recompile.
+        if (funcAddr == 0)
+          continue;
         if (graph.isEntryPoint(funcAddr))
           continue;
         if (binary.isInImportExportRange(funcAddr))
@@ -263,7 +289,33 @@ void discoverAllFunctions(CodegenContext& ctx) {
     }
   }
 
-  REXCODEGEN_INFO("Analyze: {} total functions after vtable scan", graph.functionCount());
+  // Function-pointer scan: walk the decoded instruction stream looking for
+  // `lis hi; addi lo` and `lis hi; ori lo` register-load pairs that build a
+  // 32-bit address landing in the code region. These are typically callback
+  // pointer installations or static function-pointer-table populations. EA
+  // titles like Skate 3 ship without MSVC RTTI, so the vtable scanner above
+  // finds nothing and we'd otherwise miss most C++-style indirect-call
+  // targets. Heuristics in `functionPointerScan` skip near-PC loads (likely
+  // PIC local labels) and require the resulting address to land in a real
+  // code region. Run after the vtable iterations so anything the scanner
+  // surfaces still gets full block discovery via the loop below.
+  functionPointerScan(ctx);
+  {
+    size_t fpIteration = 0;
+    constexpr size_t kMaxFpIterations = 4;
+    while (fpIteration < kMaxFpIterations) {
+      fpIteration++;
+      auto knownFunctions = buildKnownFunctions(graph);
+      if (discoverPendingFunctions(ctx, knownFunctions) == 0)
+        break;
+      if (graph.functionCount() == lastFunctionCount)
+        break;
+      lastFunctionCount = graph.functionCount();
+    }
+  }
+
+  REXCODEGEN_INFO("Analyze: {} total functions after vtable + function-pointer scan",
+                  graph.functionCount());
 }
 
 //=============================================================================

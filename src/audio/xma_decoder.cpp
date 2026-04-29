@@ -256,11 +256,17 @@ uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
       break;
     }
     default:
-      const auto register_info = register_file_.GetRegisterInfo(r);
-      if (register_info) {
-        REXAPU_DEBUG("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
-      } else {
-        REXAPU_DEBUG("XMA: Read from unknown register ({:04X})", r);
+      static thread_local uint32_t unhandled_read_log_count = 0;
+      uint32_t read_log_index = unhandled_read_log_count++;
+      if (read_log_index < 32) {
+        const auto register_info = register_file_.GetRegisterInfo(r);
+        if (register_info) {
+          REXAPU_DEBUG("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
+        } else {
+          REXAPU_DEBUG("XMA: Read from unknown register ({:04X})", r);
+        }
+      } else if (read_log_index == 32) {
+        REXAPU_DEBUG("XMA: further unhandled register read logs suppressed");
       }
       break;
   }
@@ -336,13 +342,25 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // 0601h (1804h) is written to with 0x02000000 and 0x03000000 around a lock
     // operation
     switch (r) {
+      // 0x601 is a hardware-side lock sentinel -- writes do not require
+      // decoder state changes. Xenia/Xenos APU programming guide treat
+      // these writes as no-ops. Silencing here to keep Skate 3's per-frame
+      // XMA driver poll from spamming the log.
+      case 0x601:
+        break;
       default: {
-        const auto register_info = register_file_.GetRegisterInfo(r);
-        if (register_info) {
-          REXAPU_DEBUG("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
-                       register_info->name, value);
-        } else {
-          REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+        static thread_local uint32_t unhandled_write_log_count = 0;
+        uint32_t write_log_index = unhandled_write_log_count++;
+        if (write_log_index < 32) {
+          const auto register_info = register_file_.GetRegisterInfo(r);
+          if (register_info) {
+            REXAPU_DEBUG("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
+                         register_info->name, value);
+          } else {
+            REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+          }
+        } else if (write_log_index == 32) {
+          REXAPU_DEBUG("XMA: further unhandled register write logs suppressed");
         }
         break;
       }

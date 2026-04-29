@@ -40,6 +40,13 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t context_id = memory::load_and_swap<uint32_t>(buffer + 16);
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
+      // Persist the context value so subsequent GetContext calls return it.
+      // Skate 3 menu UI is gated on this round-trip working.
+      {
+        std::lock_guard<std::mutex> g(user_data_lock_);
+        uint64_t key = (uint64_t(user_index) << 32) | uint64_t(context_id);
+        user_contexts_[key] = context_value;
+      }
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
       return X_E_SUCCESS;
@@ -353,13 +360,26 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
       auto context = context_ptr ? memory_->TranslateVirtual(context_ptr) : nullptr;
       uint32_t context_id = context ? memory::load_and_swap<uint32_t>(context + 0) : 0;
-      REXKRNL_DEBUG("XGIUserGetContext({:08X}, {:08X}, {:08X}))", user_index, context_ptr,
-                    context_id);
+      // Look up persisted value from previous SetContext call. If never
+      // written, return 0. CRITICAL: return X_E_SUCCESS (not X_E_FAIL).
+      // EA RenderWare titles (Skate 3) gate menu UI rendering on this
+      // round-trip succeeding -- X_E_FAIL is interpreted as "user state not
+      // ready" and stalls the menu state machine.
       uint32_t value = 0;
+      {
+        std::lock_guard<std::mutex> g(user_data_lock_);
+        uint64_t key = (uint64_t(user_index) << 32) | uint64_t(context_id);
+        auto it = user_contexts_.find(key);
+        if (it != user_contexts_.end()) {
+          value = it->second;
+        }
+      }
+      REXKRNL_DEBUG("XGIUserGetContext({:08X}, {:08X}, ctx_id={:08X}) -> value={:08X}",
+                    user_index, context_ptr, context_id, value);
       if (context) {
         memory::store_and_swap<uint32_t>(context + 4, value);
       }
-      return X_E_FAIL;
+      return X_E_SUCCESS;
     }
     case 0x000B0060: {
       assert_true(!buffer_length || buffer_length == 32);
