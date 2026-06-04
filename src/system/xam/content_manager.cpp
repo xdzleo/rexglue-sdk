@@ -58,8 +58,9 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   // would mask a resolution bug as a silently-empty mount. A save (write) path
   // creates its dir via ContentManager::CreateContent before this ctor runs.
   bool exists = std::filesystem::exists(package_path);
-  auto device =
-      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, exists);
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path,
+                                                                  exists,
+                                                                  /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
