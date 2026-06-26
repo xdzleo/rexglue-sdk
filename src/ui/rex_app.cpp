@@ -42,7 +42,6 @@
 #include <rex/kernel/init.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
-#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>

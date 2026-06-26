@@ -208,6 +208,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   virtual void OnWindowPixelSizeChanged(uint32_t pixel_width, uint32_t pixel_height) {
     (void)pixel_width;
     (void)pixel_height;
+  }
 
   /// The user asked to close the window (close button, Alt+F4). Return false
   /// to veto and close later explicitly (window()->RequestClose()) after
