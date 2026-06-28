@@ -13,9 +13,12 @@
 #include "codegen_flags.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <fmt/format.h>
 #include <inja/inja.hpp>
@@ -226,23 +229,56 @@ bool CodegenWriter::write(bool force) {
   if (runtime_)
     emitCtx.resolver = runtime_->export_resolver();
 
-  // Generate recomp files with size-based splitting
+  // Generate recomp files with size-based splitting.
+  //
+  // emitCpp() is a pure, const, read-only transform (it builds a local string
+  // from the binary image, the function graph and the export tables; the only
+  // shared lookup, GetExportByOrdinal, is read-only). So emit every function's
+  // C++ in parallel across all cores, then assemble the units serially in
+  // address order. The output is byte-identical to the sequential version, but
+  // the (previously single-threaded) codegen now saturates the CPU -- this is
+  // the per-iteration hot path of the run-heal rebuild loop.
   REXCODEGEN_TRACE("Recompiling {} functions...", functions.size());
+
+  std::vector<std::string> codes(functions.size());
+  {
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned nthreads = static_cast<unsigned>(std::min<size_t>(hw, functions.size()));
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+      for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < functions.size();
+           i = next.fetch_add(1, std::memory_order_relaxed)) {
+        codes[i] = functions[i]->emitCpp(emitCtx);
+      }
+    };
+    if (nthreads <= 1) {
+      worker();
+    } else {
+      std::vector<std::thread> pool;
+      pool.reserve(nthreads);
+      for (unsigned t = 0; t < nthreads; ++t)
+        pool.emplace_back(worker);
+      for (auto& th : pool)
+        th.join();
+    }
+  }
+
+  const size_t maxFileSize = REXCVAR_GET(max_file_size_bytes);
   size_t currentFileBytes = 0;
   println("#include \"{}_init.h\"\n", projectName);
 
   for (size_t i = 0; i < functions.size(); i++) {
-    std::string code = functions[i]->emitCpp(emitCtx);
+    std::string& code = codes[i];
 
-    if (currentFileBytes > 0 && currentFileBytes + code.size() > REXCVAR_GET(max_file_size_bytes)) {
+    if (currentFileBytes > 0 && currentFileBytes + code.size() > maxFileSize) {
       SaveCurrentOutData();
       println("#include \"{}_init.h\"\n", projectName);
       currentFileBytes = 0;
     }
 
-    if (code.size() > REXCVAR_GET(max_file_size_bytes)) {
+    if (code.size() > maxFileSize) {
       REXCODEGEN_WARN("Function 0x{:08X} is {} bytes, exceeds max_file_size_bytes ({})",
-                      functions[i]->base(), code.size(), REXCVAR_GET(max_file_size_bytes));
+                      functions[i]->base(), code.size(), maxFileSize);
     }
 
     out += code;

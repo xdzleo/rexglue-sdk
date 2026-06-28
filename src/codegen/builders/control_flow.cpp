@@ -12,6 +12,8 @@
 #include "builder_context.h"
 #include "helpers.h"
 
+#include <set>
+
 #include <fmt/format.h>
 
 #include <rex/logging.h>
@@ -125,19 +127,23 @@ bool build_bctr(BuilderContext& ctx) {
   }
 
   if (jt) {
-    ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    // switch-on-ctr: match on the REAL computed value (ctx.ctr, set by mtctr to
+    // the target loaded from the table), NOT on an index register that the
+    // scaling may have overwritten in place. Correct for every idiom (absolute or
+    // relative, index preserved or clobbered). The default self-heals via an
+    // indirect call resolved at runtime instead of __builtin_trap (which crashed
+    // the title the moment an unresolved/clobbered dispatch ran).
+    ctx.println("\tswitch ({}.u32) {{", ctx.ctr());
 
+    std::set<uint32_t> emittedCases;  // distinct indices can map to the same target
     for (size_t i = 0; i < jt->targets.size(); i++) {
-      ctx.println("\tcase {}:", i);
       auto label = jt->targets[i];
+      if (label == 0)
+        continue;  // skip a null target (never emitted here) -> self-heals via the default
+      if (!emittedCases.insert(label).second)
+        continue;  // duplicate case value -> emit once
 
-      // TODO(tomc): Figure out if this actually is triggered on real hardware and what would
-      // happen?
-      if (label == 0) {
-        ctx.println("\t\t__builtin_trap(); // ERROR - detected jump to null value");
-        continue;
-      }
-
+      ctx.println("\tcase 0x{:X}:", label);
       auto kind = ctx.graph().classifyTarget(label, ctx.base, false);
       switch (kind) {
         case TargetKind::InternalLabel:
@@ -147,27 +153,21 @@ bool build_bctr(BuilderContext& ctx) {
         case TargetKind::Import:
           if (auto* targetFn = ctx.graph().getFunction(label)) {
             ctx.println("\t\t{}(ctx, base);", targetFn->name());
+            ctx.println("\t\treturn;");
           } else {
-            REXCODEGEN_ERROR(
-                "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
-                label, ctx.base);
-            ctx.println(
-                "\t\tREX_FATAL(\"Jump target 0x{:08X} classified as function but not "
-                "in graph at bctr 0x{:08X}\");",
-                label, ctx.base);
+            ctx.println("\t\tREX_CALL_INDIRECT_FUNC(0x{:X}); return;", label);
           }
-          ctx.println("\t\treturn;");
           break;
         default:
-          REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);
-          ctx.println("\t\tREX_FATAL(\"Jump target 0x{:08X} unresolved at bctr 0x{:08X}\");", label,
-                      ctx.base);
+          // unclassified target: self-heal (let the runtime resolve it)
+          ctx.println("\t\tREX_CALL_INDIRECT_FUNC(0x{:X}); return;", label);
           break;
       }
     }
 
     ctx.println("\tdefault:");
-    ctx.println("\t\t__builtin_trap(); // Switch case out of range");
+    ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32); return; // self-heal: target not in table",
+                ctx.ctr());
     ctx.println("\t}}");
 
     ctx.reset_switch_table();

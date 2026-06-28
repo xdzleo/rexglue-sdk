@@ -961,6 +961,9 @@ void FunctionGraph::addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, u
 
   // Not resolvable yet - add as unresolved
   node->addUnresolvedJump(site, target, isCall, conditional);
+  // Index by target so notifyFunctionAdded only touches nodes that can resolve
+  // against a future function at this exact address (avoids the O(F^2) full scan).
+  unresolvedByTarget_[target].push_back(node);
   REXCODEGEN_TRACE("FunctionGraph: added unresolved {} 0x{:08X}->0x{:08X} to function 0x{:08X}",
                    isCall ? "call" : "jump", site, target, entry);
 }
@@ -1206,8 +1209,18 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
 }
 
 void FunctionGraph::notifyFunctionAdded(FunctionNode* newFunction) {
-  for (auto& [base, node] : functions_) {
-    if (node.get() != newFunction && node->isPending()) {
+  // A pending node resolves against newFunction only when one of its unresolved
+  // jumps targets exactly newFunction->base() (FunctionNode::tryResolveAgainst).
+  // Consult the by-target index and touch only those nodes, instead of scanning
+  // every function on every add (previously O(F^2) across the Discover phase).
+  // Result is identical: each node resolves only its own jumps, independently of
+  // the order nodes are visited, and tryResolveAgainst re-checks so stale/duplicate
+  // index entries are harmless no-ops.
+  auto it = unresolvedByTarget_.find(newFunction->base());
+  if (it == unresolvedByTarget_.end())
+    return;
+  for (FunctionNode* node : it->second) {
+    if (node != newFunction && node->isPending()) {
       node->tryResolveAgainst(newFunction);
     }
   }

@@ -195,6 +195,15 @@ class FunctionGraph {
   std::vector<std::pair<uint32_t, uint32_t>> chunks_;    // base, size pairs
   MemoryReader memoryReader_;
 
+  // Index: exact jump target -> nodes that have an unresolved jump to it.
+  // notifyFunctionAdded() resolves a jump only when its target == the new
+  // function's base (see FunctionNode::tryResolveAgainst), so this lets it touch
+  // just the nodes that can actually resolve, instead of scanning every function
+  // on every add (the O(F^2) cost that dominated the Discover phase). Entries may
+  // go stale once a jump resolves; tryResolveAgainst re-checks unresolvedJumps_,
+  // so stale entries are harmless no-ops (no removal needed for correctness).
+  std::unordered_map<uint32_t, std::vector<FunctionNode*>> unresolvedByTarget_;
+
   // Notify all PENDING functions that a new function was added
   void notifyFunctionAdded(FunctionNode* newFunction);
 };
