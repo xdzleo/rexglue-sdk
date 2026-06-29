@@ -23,6 +23,10 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+
 namespace rex::runtime {
 
 namespace {
@@ -35,8 +39,24 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  uint32_t target = ctx.last_indirect_target;
+  // Discovery mode (env REX_HEAL_DISCOVER set): instead of aborting on the FIRST
+  // unregistered indirect target, log it once (the same message the heal loop
+  // greps) and RETURN, so a single run surfaces MANY missing functions to register
+  // in one rebuild -- turning the O(N) play-and-heal cycle into a few rounds. The
+  // continuation runs with a no-op'd call so state may be corrupt, but every
+  // reached target is logged first and successive rounds converge to the full set.
+  static const bool discover = std::getenv("REX_HEAL_DISCOVER") != nullptr;
+  if (discover) {
+    static std::mutex mtx;
+    static std::unordered_set<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (seen.insert(target).second) {
+      REXLOG_WARN("Call to invalid or unregistered function at guest address 0x{:08X}", target);
+    }
+    return;
+  }
+  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", target);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
