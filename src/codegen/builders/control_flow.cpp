@@ -16,6 +16,8 @@
 
 #include <rex/logging.h>
 
+#include <set>
+
 #include "../codegen_logging.h"
 
 namespace rex::codegen {
@@ -154,49 +156,39 @@ bool build_bctr(BuilderContext& ctx) {
   }
 
   if (jt) {
-    ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    // switch-on-CTR. At the bctr, ctr already holds the target loaded from the
+    // jump table (mtctr rN; bctr), so match on the deduplicated TARGET addresses
+    // rather than the index register. The Xenon scaling/load idiom frequently
+    // overwrites the index register in place (rlwinm rX,rX,2; lwzx rX,base,rX),
+    // so switch(indexReg) would compare a loaded address against 0..N and always
+    // fall to default. Matching ctr is correct for every idiom and makes the
+    // `register` field irrelevant. Internal labels jump in-function; function
+    // entries call directly; anything not listed (or an index out of range) falls
+    // to a normal indirect call that self-heals -- never a trap.
+    ctx.println("\tswitch ({}.u32) {{", ctx.ctr());
 
+    std::set<uint32_t> emitted;
     for (size_t i = 0; i < jt->targets.size(); i++) {
-      ctx.println("\tcase {}:", i);
       auto label = jt->targets[i];
-
-      // TODO(tomc): Figure out if this actually is triggered on real hardware and what would
-      // happen?
-      if (label == 0) {
-        ctx.println("\t\t__builtin_trap(); // ERROR - detected jump to null value");
-        continue;
+      if (label == 0 || !emitted.insert(label).second) {
+        continue;  // skip null slots and duplicate targets (would be a dup case)
       }
-
-      auto kind = ctx.graph().classifyTarget(label, ctx.fn.base(), false);
-      switch (kind) {
-        case TargetKind::InternalLabel:
-          ctx.println("\t\tgoto loc_{:X};", label);
-          break;
-        case TargetKind::Function:
-        case TargetKind::Import:
-          if (auto* targetFn = ctx.graph().getFunction(label)) {
-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
-          } else {
-            REXCODEGEN_ERROR(
-                "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
-                label, ctx.base);
-            ctx.println(
-                "\t\tREX_FATAL(\"Jump target 0x{:08X} classified as function but not "
-                "in graph at bctr 0x{:08X}\");",
-                label, ctx.base);
-          }
-          ctx.println("\t\treturn;");
-          break;
-        default:
-          REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);
-          ctx.println("\t\tREX_FATAL(\"Jump target 0x{:08X} unresolved at bctr 0x{:08X}\");", label,
-                      ctx.base);
-          break;
+      auto kind = ctx.graph().classifyTarget(label, ctx.base, false);
+      ctx.println("\tcase 0x{:X}:", label);
+      if (kind == TargetKind::InternalLabel) {
+        ctx.println("\t\tgoto loc_{:X};", label);
+      } else if (auto* targetFn = ctx.graph().getFunction(label)) {
+        ctx.println("\t\t{}(ctx, base);", targetFn->name());
+        ctx.println("\t\treturn;");
+      } else {
+        ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
+        ctx.println("\t\treturn;");
       }
     }
 
     ctx.println("\tdefault:");
-    ctx.println("\t\t__builtin_trap(); // Switch case out of range");
+    ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
+    ctx.println("\t\treturn;");
     ctx.println("\t}}");
 
     ctx.reset_switch_table();
