@@ -201,6 +201,11 @@ class FunctionGraph {
   std::unordered_map<uint32_t, bool> functionHasXrefs_;  // entry -> hasXrefs
   std::vector<std::pair<uint32_t, uint32_t>> chunks_;    // base, size pairs
   std::unordered_map<uint32_t, uint32_t> chunkParents_;  // chunk base -> parent base
+  // O(F) acceleration index for notifyFunctionAdded: target address -> source
+  // function entry bases that have an unresolved jump to that target. Lets a new
+  // function's resolution touch only the pending functions that target it,
+  // instead of scanning every function (O(F^2)).
+  std::unordered_map<uint32_t, std::vector<uint32_t>> unresolvedByTarget_;
   std::string symbolPrefix_;
   MemoryReader memoryReader_;
 

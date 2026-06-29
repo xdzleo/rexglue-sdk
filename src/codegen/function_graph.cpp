@@ -1001,6 +1001,7 @@ void FunctionGraph::addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, u
 
   // Not resolvable yet - add as unresolved
   node->addUnresolvedJump(site, target, isCall, conditional);
+  unresolvedByTarget_[target].push_back(entry);  // index for O(F) notifyFunctionAdded
   REXCODEGEN_TRACE("FunctionGraph: added unresolved {} 0x{:08X}->0x{:08X} to function 0x{:08X}",
                    isCall ? "call" : "jump", site, target, entry);
 }
@@ -1295,26 +1296,43 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
 }
 
 void FunctionGraph::notifyFunctionAdded(FunctionNode* newFunction) {
-  for (auto& [base, node] : functions_) {
-    if (node.get() != newFunction && node->isPending()) {
-      auto jumps = node->unresolvedJumps();
-      for (const auto& jump : jumps) {
-        if (jump.target != newFunction->base()) {
-          continue;
-        }
-
-        if (!jump.isCall && chunkParent(jump.target) != 0 &&
-            HasEmittedBlockContaining(node.get(), jump.target)) {
-          node->addLabel(jump.target);
-          node->removeUnresolvedJump(jump.site);
-          REXCODEGEN_TRACE(
-              "FunctionGraph: resolved 0x{:08X}->0x{:08X} as emitted chunk label in 0x{:08X}",
-              jump.site, jump.target, node->base());
-        }
+  // O(F) path: only pending functions with an unresolved jump to this function's
+  // entry can be affected. Consult the index instead of scanning all functions.
+  // Iteration order is irrelevant to output: each node resolves only its OWN
+  // jumps against newFunction (no cross-node state), so processing the indexed
+  // subset in any order yields the same result as the full O(F^2) scan.
+  auto it = unresolvedByTarget_.find(newFunction->base());
+  if (it == unresolvedByTarget_.end()) {
+    return;
+  }
+  // Copy + dedup: a node may have several jumps to the same target, and the
+  // index keeps stale entries (jumps resolved / functions removed). getFunction
+  // filters removed nodes; isPending filters resolved ones.
+  std::vector<uint32_t> sources = it->second;
+  std::sort(sources.begin(), sources.end());
+  sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+  for (uint32_t srcBase : sources) {
+    FunctionNode* node = getFunction(srcBase);
+    if (!node || node == newFunction || !node->isPending()) {
+      continue;
+    }
+    auto jumps = node->unresolvedJumps();
+    for (const auto& jump : jumps) {
+      if (jump.target != newFunction->base()) {
+        continue;
       }
 
-      node->tryResolveAgainst(newFunction);
+      if (!jump.isCall && chunkParent(jump.target) != 0 &&
+          HasEmittedBlockContaining(node, jump.target)) {
+        node->addLabel(jump.target);
+        node->removeUnresolvedJump(jump.site);
+        REXCODEGEN_TRACE(
+            "FunctionGraph: resolved 0x{:08X}->0x{:08X} as emitted chunk label in 0x{:08X}",
+            jump.site, jump.target, node->base());
+      }
     }
+
+    node->tryResolveAgainst(newFunction);
   }
 }
 
