@@ -285,7 +285,15 @@ void discoverAllFunctions(CodegenContext& ctx) {
         // hybrid then can't route calls there and falls back to JIT.
         if (FunctionNode* parent = graph.getFunctionContaining(funcAddr);
             parent != nullptr && parent->base() != funcAddr) {
-          graph.registerChunk(funcAddr, 4, parent->base());
+          // Mid-function vtable landing: register it as a standalone VTABLE
+          // function so indirect bctrl / virtual calls resolve via getFunction().
+          // Do NOT registerChunk here -- that was the actual Budokai 3 regression:
+          // adding funcAddr to chunkParents_ makes isLocalChunkTarget() lower the
+          // PARENT's own bctr/jump-table edges as local gotos, corrupting the
+          // parent's bctr (ctr=0xFFFFFFFF -> FATAL ~2s). A plain function entry
+          // (no chunk) restores the clean-SDK discovery coverage while leaving the
+          // parent's bctr lowering byte-identical -- it is exactly what the runtime
+          // heal loop back-fills (e.g. 0x82B30790 = {}), minus the round-trip.
           graph.addFunction(funcAddr, 4, FunctionAuthority::VTABLE, true);
           vtableLandings++;
           newFunctions++;
