@@ -244,6 +244,14 @@ bool Memory::Initialize() {
   rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
                           rex::memory::AllocationType::kCommit,
                           rex::memory::PageAccess::kReadWrite);
+  // Also commit the vA0000000 physical-aperture alias. The game's
+  // MmAllocatePhysicalMemory hands out per-frame GPU command buffers from this
+  // 0xA0000000-0xC0000000 view; the physical pre-commit above backs the
+  // physical_membase_ region but NOT this virtual alias, so the ring writes
+  // (e.g. 0xBFAC0000) page-fault -> battle freeze. Commit it so those writes land.
+  rex::memory::AllocFixed(heaps_.vA0000000.TranslateRelative(0), heaps_.vA0000000.heap_size(),
+                          rex::memory::AllocationType::kCommit,
+                          rex::memory::PageAccess::kReadWrite);
 #if REX_PLATFORM_MAC
   // The 0x7F000000-0x7FFFFFFF view aliases the start of physical memory. Touch
   // it explicitly on macOS so raw generated loads through this alias don't SIGBUS
@@ -681,12 +689,51 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                                  bool enable_invalidation_notifications,
                                                  bool enable_data_providers) {
+  // Never write-watch the GPU command ring (its physical span, registered via
+  // VdInitializeRingBuffer -> CommandProcessor::InitializeRingBuffer ->
+  // Memory::SetCommandRingSpan). The recompiled producer writes it thousands of
+  // times per frame; watching it causes a per-packet access-violation storm that
+  // freezes battles. The CommandProcessor consumes it directly (TranslatePhysical),
+  // so it never needs CPU-write invalidation. Clip the ring span out of the
+  // watched range; textures / vertex buffers / framebuffer stay watched so there
+  // are no visual artifacts.
+  if (cmd_ring_phys_first_ < cmd_ring_phys_last_ && length != 0) {
+    uint32_t end = physical_address + length;  // exclusive
+    if (physical_address < cmd_ring_phys_last_ && end > cmd_ring_phys_first_) {
+      if (physical_address < cmd_ring_phys_first_) {
+        EnablePhysicalMemoryAccessCallbacks(physical_address,
+                                            cmd_ring_phys_first_ - physical_address,
+                                            enable_invalidation_notifications, enable_data_providers);
+      }
+      if (end > cmd_ring_phys_last_) {
+        EnablePhysicalMemoryAccessCallbacks(cmd_ring_phys_last_, end - cmd_ring_phys_last_,
+                                            enable_invalidation_notifications, enable_data_providers);
+      }
+      return;
+    }
+  }
   heaps_.vA0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vC0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
+}
+
+void Memory::SetCommandRingSpan(uint32_t guest_ptr, uint32_t size) {
+  if (!size) {
+    cmd_ring_phys_first_ = 1;  // disabled (first > last)
+    cmd_ring_phys_last_ = 0;
+    return;
+  }
+  uint32_t phys = GetPhysicalAddress(guest_ptr);
+  if (phys == UINT32_MAX) {
+    cmd_ring_phys_first_ = 1;
+    cmd_ring_phys_last_ = 0;
+    return;
+  }
+  cmd_ring_phys_first_ = phys;
+  cmd_ring_phys_last_ = phys + size;  // exclusive
 }
 
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {

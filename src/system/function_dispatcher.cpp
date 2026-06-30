@@ -56,7 +56,8 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
     }
     return;
   }
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", target);
+  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X} "
+            "(called from lr=0x{:08X})", target, static_cast<uint32_t>(ctx.lr));
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

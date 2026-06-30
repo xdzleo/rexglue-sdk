@@ -472,6 +472,11 @@ class Memory {
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
 
+  // Registers the GPU command-ring physical span so it is excluded from the
+  // GPU-resource write-watch (see EnablePhysicalMemoryAccessCallbacks). Called
+  // from CommandProcessor::InitializeRingBuffer. Pass size 0 to clear.
+  void SetCommandRingSpan(uint32_t guest_ptr, uint32_t size);
+
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
   // watched. Must be called with global critical region locking depth of 1.
@@ -545,6 +550,11 @@ class Memory {
   uint32_t system_allocation_granularity_ = 0;
   uint8_t* virtual_membase_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
+
+  // GPU command-ring physical span [first, last) excluded from the write-watch
+  // (set via SetCommandRingSpan). Default first > last == disabled.
+  uint32_t cmd_ring_phys_first_ = 1;
+  uint32_t cmd_ring_phys_last_ = 0;
 
   struct FunctionTableEntry {
     uint32_t table_base;

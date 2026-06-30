@@ -429,6 +429,11 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  // Exclude the command ring from the GPU-resource write-watch so the recompiled
+  // producer writing it every frame doesn't trigger a per-packet access-violation
+  // storm (the battle freeze). The CP consumes the ring directly, so it never
+  // needs CPU-write invalidation tracking.
+  memory_->SetCommandRingSpan(primary_buffer_ptr_, primary_buffer_size_);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
