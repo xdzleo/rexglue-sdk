@@ -1433,6 +1433,16 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // Match XThread::Execute (xthread.cpp:621): initialize this host-dispatch
+  // context's FP state so guest float ops run with host FP exceptions MASKED.
+  // Without this the context's cached MXCSR is 0 (thread_state.cpp memsets the
+  // PPCContext), and the guest's flush-mode toggles (FPSCRRegister::*FlushMode*)
+  // then overwrite the host MXCSR with that 0 -> inexact unmasked -> the first
+  // inexact guest float op on this worker traps as STATUS_FLOAT_INEXACT_RESULT
+  // (0xC000008F). XHostThread runs host_fn_() directly and previously skipped
+  // this init that every guest XThread already does.
+  thread_state_->context()->fpscr.InitHost();
+
   int ret = host_fn_();
 
   // Exit.

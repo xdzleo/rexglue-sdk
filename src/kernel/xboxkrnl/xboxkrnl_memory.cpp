@@ -387,10 +387,17 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   // min_addr_range/max_addr_range are bounds in physical memory, not virtual.
   uint32_t heap_base = heap->heap_base();
   uint32_t heap_physical_address_offset = heap->GetPhysicalAddress(heap_base);
-  // NOTE: xenia-canary has a per-title workaround (ignore_offset_for_ranged_allocations cvar)
-  // for title 545108B4 where min_addr_range comparison fails due to 0x1000 offset.
-  // If needed, set heap_physical_address_offset = 0 when min_addr_range && max_addr_range.
-  // Reference: xenia-canary 81aaf98e0.
+  // xenia-canary ignore_offset_for_ranged_allocations (ref 81aaf98e0): Yukes-engine
+  // titles (WWE SmackDown vs Raw 545107E0/545108B4, ...) issue MmAllocatePhysicalMemoryEx
+  // with explicit min/max that are ALREADY heap-relative; subtracting the physical
+  // offset (e.g. 0x1000) then shifts the window so AllocRange finds no contiguous range
+  // and the title dies during cache/asset bring-up ("failed to find contiguous range").
+  // Only a *ranged* request is affected -- the common MmAllocatePhysicalMemory path passes
+  // min=0/max=0xFFFFFFFF, so it stays byte-identical for every non-ranged allocation.
+  const bool ranged_alloc = (min_addr_range != 0) || (max_addr_range != 0xFFFFFFFFu);
+  if (ranged_alloc) {
+    heap_physical_address_offset = 0;
+  }
   uint32_t heap_min_addr = rex::sat_sub(min_addr_range, heap_physical_address_offset);
   uint32_t heap_max_addr = rex::sat_sub(max_addr_range, heap_physical_address_offset);
   uint32_t heap_size = heap->heap_size();

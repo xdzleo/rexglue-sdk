@@ -329,9 +329,26 @@ bool Runtime::SetupVfs() {
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
   }
 
-  // NOTE: Do NOT register a device for cache: paths
-  // Games handle "device not found" gracefully but don't handle actual device
-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
+  // Mount a WRITABLE cache:\ device. Yukes-engine titles (e.g. WWE SmackDown vs
+  // Raw, title 545107E0) decompress their PAC asset packs from the disc into the
+  // Xbox 360 CACHE: scratch partition and then read them back; with no cache
+  // device every CACHE:\PAC\... open returns 0xC000000F and the title stalls
+  // loading content (menus/models). A writable HostPathDevice creates the dir
+  // and lets the stage+read round-trip succeed, matching the newer community SDK.
+  {
+    std::filesystem::path cache_host = !cache_root_.empty()
+                                           ? (cache_root_ / "guest_cache")
+                                           : (abs_game_root.parent_path() / "cache");
+    auto cache_mount = "\\Device\\Harddisk0\\PartitionCache";
+    auto cache_device = std::make_unique<rex::filesystem::HostPathDevice>(
+        cache_mount, cache_host, /*read_only=*/false);
+    if (cache_device->Initialize() && file_system_->RegisterDevice(std::move(cache_device))) {
+      file_system_->RegisterSymbolicLink("cache:", cache_mount);
+      REXSYS_INFO("  Mounted writable {} at cache:", cache_host.string());
+    } else {
+      REXSYS_WARN("  cache: mount failed ({}); title cache reads will 0xC000000F", cache_host.string());
+    }
+  }
 
   return true;
 }
