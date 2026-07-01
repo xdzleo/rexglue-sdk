@@ -1817,7 +1817,8 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
 BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
                                     const CodeRegion& containingRegion,
                                     const std::unordered_set<uint32_t>& knownFunctions,
-                                    uint32_t pdataSize) {
+                                    uint32_t pdataSize,
+                                    const std::unordered_set<uint32_t>* forcedLandings) {
   BlockDiscoveryResult result;
   std::unordered_set<uint32_t> visited;
   std::unordered_set<uint32_t> blockStarts;
@@ -1838,6 +1839,34 @@ BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
   // Start with entry point
   worklist.push(entryPoint);
   blockStarts.insert(entryPoint);
+
+  // Two passes: (0) normal discovery from the entry, then (1) seed only the config
+  // jump-table landings that normal flow did NOT reach. Seeding AFTER the first drain
+  // (gated on !visited) is essential: a landing normal discovery already covers must
+  // keep its natural block boundaries (forcing it as a block start pre-emptively
+  // re-split joust). Only genuinely-unreachable landings -- Gears sub_830AFE28's
+  // decompressor cases, reachable solely via the bctr that detectJumpTable
+  // under-recovered -- are seeded, so their loc_ labels appear and the function stays
+  // whole. nullptr/empty seeds, or a title whose landings are all reached => the pass-1
+  // seed adds nothing => byte-identical.
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      if (!forcedLandings)
+        break;
+      for (uint32_t t : *forcedLandings) {
+        if (t < entryPoint || t >= funcEnd)
+          continue;
+        if (visited.contains(t))
+          continue;  // already covered by normal control flow -> leave it untouched
+        if (!decoded.get(t))
+          continue;
+        result.labels.insert(t);
+        if (!blockStarts.contains(t)) {
+          blockStarts.insert(t);
+          worklist.push(t);
+        }
+      }
+    }
 
   while (!worklist.empty()) {
     uint32_t blockStart = worklist.front();
@@ -1996,6 +2025,7 @@ BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
       result.blocks.push_back(block);
     }
   }
+  }  // end two-pass loop (normal discovery, then seed unreached config landings)
 
   // Sort blocks by address
   std::sort(result.blocks.begin(), result.blocks.end(),

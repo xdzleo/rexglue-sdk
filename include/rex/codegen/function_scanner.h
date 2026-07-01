@@ -251,12 +251,23 @@ struct BlockDiscoveryResult {
  * @param entryPoint Starting address of the function
  * @param containingRegion Code region containing the entry point
  * @param knownFunctions Set of known function entry points (to detect tail calls)
+ * @param pdataSize Declared function size (0 => discover to region end)
+ * @param forcedLandings Optional explicit set of jump-table landing addresses (from the
+ *        config `forced_landings` array). After normal discovery, any of these that fall
+ *        inside this function's extent and were NOT reached by normal control flow are
+ *        seeded as in-function blocks, so a landing the heuristic detectJumpTable
+ *        under-recovered emits its loc_ label and the routine stays whole. The list is
+ *        authored by rexauto from real "use of undeclared label" errors (which are, by
+ *        definition, orphan in-function landings -- never separate functions), so no
+ *        heuristic filtering is needed here. nullptr/empty => no seeding (byte-identical).
  * @return BlockDiscoveryResult containing blocks, branches, and jump tables
  */
 BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
                                     const CodeRegion& containingRegion,
                                     const std::unordered_set<uint32_t>& knownFunctions,
-                                    uint32_t pdataSize = 0);
+                                    uint32_t pdataSize = 0,
+                                    const std::unordered_set<uint32_t>*
+                                        forcedLandings = nullptr);
 
 //=============================================================================
 // Jump Table Detection

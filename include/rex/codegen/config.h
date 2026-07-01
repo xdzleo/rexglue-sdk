@@ -106,6 +106,12 @@ struct RecompilerConfig {
   // === Manual overrides ===
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
   std::unordered_map<uint32_t, JumpTable> switchTables;
+  /// Explicit jump-table landing addresses to force-recover as in-function blocks
+  /// (from a `forced_landings = [0x..]` TOML array). Used when the heuristic
+  /// detectJumpTable under-recovers a hand-written computed-goto routine and leaves a
+  /// landing as a dangling `goto loc_T` with no block: seeding the exact address keeps
+  /// the function whole. Empty unless a title explicitly needs it -> byte-identical.
+  std::unordered_set<uint32_t> forcedLandings;
   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
   uint32_t longJmpAddress = 0;
   uint32_t setJmpAddress = 0;

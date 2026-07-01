@@ -315,6 +315,18 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
     }
   }
 
+  // forced_landings -- flat array of jump-table landing addresses to force-recover as
+  // in-function blocks (rexauto derives these from "use of undeclared label" errors).
+  if (auto forcedArray = toml["forced_landings"].as_array()) {
+    size_t before = cfg.forcedLandings.size();
+    for (auto& v : *forcedArray) {
+      if (auto a = v.value<int64_t>())
+        cfg.forcedLandings.insert(static_cast<uint32_t>(*a));
+    }
+    REXCODEGEN_DEBUG("[config]   forced_landings += {} (total {})",
+                     cfg.forcedLandings.size() - before, cfg.forcedLandings.size());
+  }
+
   // [[midasm_hook]] -- keyed by "address"
   if (auto midAsmHookArray = toml["midasm_hook"].as_array()) {
     for (auto& entry : *midAsmHookArray) {

@@ -132,7 +132,18 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
       }
     }
   }
-  auto result = discoverBlocks(decoded, funcAddr, *region, effectiveKnownFunctions, pdataSize);
+  // Explicit landing seeds: rexauto lists the exact addresses of jump-table landings
+  // that the SDK's heuristic detectJumpTable under-recovered (derived from the real
+  // "use of undeclared label 'loc_T'" build errors -- a dangling goto is, by
+  // definition, an InternalLabel target with no block, i.e. an orphan landing, never a
+  // separate function). discoverBlocks seeds only those that fall in THIS function and
+  // are unreached by normal flow, so the routine stays whole (Gears sub_830AFE28's
+  // decompressor). Empty for every game that has no such directive => byte-identical
+  // fleet-wide by construction (no heuristic guessing).
+  const std::unordered_set<uint32_t>* forced =
+      ctx.Config().forcedLandings.empty() ? nullptr : &ctx.Config().forcedLandings;
+  auto result =
+      discoverBlocks(decoded, funcAddr, *region, effectiveKnownFunctions, pdataSize, forced);
 
   if (result.blocks.empty()) {
     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
