@@ -141,8 +141,15 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
+  // Own the root-name bytes: value() is a string_view over GUEST memory, and this lambda
+  // runs deferred (~100ms later) on the dispatch thread -- by then the guest has often
+  // recycled the buffer, so a captured view dangles over stale/garbage bytes. That both
+  // crashed the dispatch thread (a non-UTF-8 recycled buffer threw utf8::invalid_utf8 out
+  // of the content-path conversion -> REX_FATAL) and silently mounted the save package
+  // under a garbage root (SG0_0: never resolved). Copy into an owned std::string now,
+  // while the guest buffer is still valid.
+  auto run = [content_manager, xuid, root_name = std::string(root_name.value()), flags,
+              content_data, disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
