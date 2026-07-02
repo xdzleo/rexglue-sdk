@@ -193,6 +193,11 @@ class FunctionGraph {
   // Returns how the target should be treated during code generation.
   TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
 
+  /// Sorted-by-base view of all functions (the same index getFunctionContaining
+  /// uses). Lets phases answer point-stabbing queries in O(log f) instead of
+  /// scanning functions() -- e.g. GapFill's absorbed-cleanup, which was O(f^2).
+  const std::map<uint32_t, FunctionNode*>& functionsByBase() const { return functionsByBase_; }
+
  private:
   std::vector<CodeBuffer> codeBuffers_;
   std::unordered_map<uint32_t, std::unique_ptr<FunctionNode>> functions_;

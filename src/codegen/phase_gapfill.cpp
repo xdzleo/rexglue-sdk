@@ -180,23 +180,42 @@ void cleanupAbsorbedGapFills(CodegenContext& ctx) {
   auto& graph = ctx.graph;
   std::vector<uint32_t> toRemove;
 
+  // Remove a GAP_FILL at `addr` iff SOME OTHER function containing addr is either a
+  // higher-authority (non-GAP_FILL) function OR a lower-base GAP_FILL. The old code
+  // proved this by scanning ALL functions for every GAP_FILL -- O(gapfills * total),
+  // which is 8s+ on GTA-SA and quadratic on GTA V. It is really a point-stabbing
+  // existence query, and only functions with base <= addr can contain addr, so the
+  // sorted-base index answers it by walking backward from `addr` over just the
+  // candidates whose base is within the largest function's reach. Same predicate,
+  // same removal set -> byte-identical, but O(gapfills * k) with k tiny.
+  uint32_t maxFuncSize = 0;
+  for (const auto& [addr, node] : graph.functions()) {
+    if (node->size() > maxFuncSize)
+      maxFuncSize = node->size();
+  }
+
+  const auto& byBase = graph.functionsByBase();  // ordered map<base, FunctionNode*>
   for (const auto& [addr, node] : graph.functions()) {
     if (node->authority() != FunctionAuthority::GAP_FILL)
       continue;
 
-    for (const auto& [otherAddr, otherNode] : graph.functions()) {
+    // Candidates are functions with base <= addr whose extent could still reach addr:
+    // base > addr - maxFuncSize (a function cannot contain addr if addr is farther than
+    // the largest possible size). Walk them nearest-first via the sorted index.
+    const uint32_t lowBound = (addr >= maxFuncSize) ? addr - maxFuncSize : 0;
+    auto it = byBase.upper_bound(addr);  // first base > addr
+    while (it != byBase.begin()) {
+      --it;
+      uint32_t otherAddr = it->first;
+      if (otherAddr < lowBound)
+        break;  // no earlier function can reach addr anymore
       if (otherAddr == addr)
         continue;
+      FunctionNode* otherNode = it->second;
       if (!otherNode->containsAddress(addr))
         continue;
-
-      // This GAP_FILL is inside another function's blocks
-      if (otherNode->authority() != FunctionAuthority::GAP_FILL) {
-        // Absorbed by higher authority - remove
-        toRemove.push_back(addr);
-        break;
-      } else if (otherAddr < addr) {
-        // Both GAP_FILL, other has lower address - it survives
+      // Contained by a non-GAP_FILL, or by a lower-base GAP_FILL -> absorbed.
+      if (otherNode->authority() != FunctionAuthority::GAP_FILL || otherAddr < addr) {
         toRemove.push_back(addr);
         break;
       }
