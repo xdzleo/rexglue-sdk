@@ -286,6 +286,24 @@ struct X_KTHREAD {
 };
 static_assert_size(X_KTHREAD, 0xAB0);
 
+/// Thrown by XThread::Reenter to unwind the HOST stack back to XThread::Execute
+/// after a guest fiber switch. When a title's scheduler swaps guest fibers
+/// (guest SwapContext -> KeSetCurrentStackPointers), the guest stack/registers
+/// already belong to the NEW fiber, but the host C++ call chain still holds the
+/// OLD fiber's frames -- resuming them would run old code on the new guest stack
+/// (and pile host frames up per switch until overflow). Same mechanism as
+/// mainline Xenia (xthread.cc reenter_exception); required by the PlatinumGames
+/// digital titles (Korra/Transformers/TMNT), Halo 3/Reach/4, Forza 2 --
+/// xenia-project/game-compatibility label kernel-KeSetCurrentStackPointers.
+class reenter_exception {
+ public:
+  explicit reenter_exception(uint32_t address) : address_(address) {}
+  uint32_t address() const { return address_; }
+
+ private:
+  uint32_t address_;
+};
+
 class XThread : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Thread;
@@ -335,6 +353,12 @@ class XThread : public XObject {
   X_STATUS Terminate(int exit_code);
 
   virtual void Execute();
+
+  /// Unwind the host stack back to Execute and resume guest execution at
+  /// `address` (the new fiber's LR). Only KeSetCurrentStackPointers calls this,
+  /// and only when the guest actually uses fibers (X_KTHREAD::fiber_ptr set) --
+  /// titles that never fiber-switch never take this path.
+  [[noreturn]] void Reenter(uint32_t address);
 
   rex::thread::Fiber* main_fiber() const { return main_fiber_; }
   void set_main_fiber(rex::thread::Fiber* fiber) { main_fiber_ = fiber; }

@@ -276,6 +276,18 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
 
   UpdateGuestStackPointers(thread, pcr, context, stack_ptr.guest_address(),
                            stack_alloc_base.value(), stack_base.value(), stack_limit.value());
+
+  // Guest fiber switch: the caller (the title's SwapContext) already saved the
+  // old fiber's registers and restored the new fiber's -- including LR, which
+  // now holds the new fiber's resume address. The host C++ call chain, however,
+  // still contains the OLD fiber's frames: returning through them would resume
+  // stale code on the new guest stack and grow the host stack on every switch.
+  // Unwind to XThread::Execute and re-enter guest code at the new LR (same as
+  // mainline Xenia). Gated on fiber_ptr: titles that never set up fibers
+  // (everything in the fleet before Korra) never take this path.
+  if (thread->fiber_ptr && current_thread->guest_object() == thread.guest_address()) {
+    current_thread->Reenter(static_cast<uint32_t>(context->lr));
+  }
 }
 
 u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,

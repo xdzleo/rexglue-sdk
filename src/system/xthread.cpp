@@ -627,13 +627,42 @@ void XThread::Execute() {
 
   // Execute the function
   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
-  func(*ctx, base);
+  // Guest fiber switches (KeSetCurrentStackPointers on a fiber'd thread) unwind
+  // to here via reenter_exception and resume at the new fiber's LR -- see
+  // XThread::Reenter. Reentry addresses can be MID-function (the return site of
+  // the fiber's own `bl SwapContext`), so resolution goes through
+  // ResolveIndirectFunction: an unregistered site funnels into the same
+  // invalid-function trap the heal pipeline already cures (discover mode logs
+  // it; register_or_seed registers it), instead of silently ending the thread.
+  uint32_t next_address;
+  try {
+    func(*ctx, base);
+    next_address = 0;
+  } catch (const reenter_exception& ree) {
+    next_address = ree.address();
+  }
+  while (next_address != 0) {
+    ctx->last_indirect_target = next_address;
+    PPCFunc* fn = runtime::ResolveIndirectFunction(next_address);
+    try {
+      fn(*ctx, base);
+      next_address = 0;
+    } catch (const reenter_exception& ree) {
+      next_address = ree.address();
+    }
+  }
 
   exit_code = static_cast<int>(ctx->r3.u32);
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).
   Exit(!want_exit_code ? 0 : exit_code);
+}
+
+void XThread::Reenter(uint32_t address) {
+  // C++ unwinding is safe here: the frames between the KeSetCurrentStackPointers
+  // shim and Execute's catch are recompiled guest functions (no host RAII state).
+  throw reenter_exception(address);
 }
 
 void XThread::EnterCriticalRegion() {
