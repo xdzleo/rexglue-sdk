@@ -56,6 +56,14 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
     }
     return;
   }
+  // Pre-abort diagnostics: bifurcate "table lookup missed" from "call path
+  // never consulted the table" (a registered-yet-flagged address means the
+  // generated call site and the dispatcher disagree about this target).
+  if (FunctionDispatcher* d = GetBoundFunctionDispatcher()) {
+    PPCFunc* f = d->GetFunction(target);
+    REXLOG_ERROR("trap diagnostics: GetFunction(0x{:08X}) = {} (registered={})",
+                 target, reinterpret_cast<void*>(f), f != nullptr);
+  }
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X} "
             "(called from lr=0x{:08X})", target, static_cast<uint32_t>(ctx.lr));
 }

@@ -19,10 +19,19 @@
 #define REX_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
 
+// NOTE: last_indirect_target must be written UNCONDITIONALLY. Table slots for
+// unregistered code hold the InvalidFunctionTrap (non-null), so the likely
+// path calls the trap directly without ever reaching the fallback branch —
+// and the trap would then report a STALE address from some earlier resolved
+// call. That ghost address sends the run-heal chasing functions that are
+// already registered (seen live on Gears of War 3: every heal round re-flagged
+// 0x8271C710, which was registered and emitted; the real unresolved target was
+// a different address entirely).
 #define REX_CALL_INDIRECT_FUNC(x)                                                          \
   do {                                                                                     \
     REX_PROFILE_INDIRECT_DISPATCH();                                                       \
     uint32_t rex_indirect_target_ = (uint32_t)(x);                                         \
+    ctx.last_indirect_target = rex_indirect_target_;                                       \
     PPCFunc* rex_indirect_func_;                                                           \
     if ((uint32_t)(rex_indirect_target_ - REX_CODE_BASE) <                                 \
         REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) [[likely]] {                               \
@@ -31,7 +40,6 @@
       rex_indirect_func_ = nullptr;                                                        \
     }                                                                                      \
     if (!rex_indirect_func_) [[unlikely]] {                                                \
-      ctx.last_indirect_target = rex_indirect_target_;                                     \
       rex_indirect_func_ = rex::runtime::ResolveIndirectFunction(rex_indirect_target_);    \
     }                                                                                      \
     rex_indirect_func_(ctx, base);                                                         \
