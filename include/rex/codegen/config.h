@@ -113,6 +113,18 @@ struct RecompilerConfig {
   /// the function whole. Empty unless a title explicitly needs it -> byte-identical.
   std::unordered_set<uint32_t> forcedLandings;
   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
+  /// Guest-image byte patches applied right after the XEX loads, BEFORE any
+  /// analysis/codegen — the community xenia-canary game-patches semantics
+  /// (be8/be16/be32/be64 writes), but baked permanently into the recompiled
+  /// native code instead of poked at every boot. From `[[guest_patches]]`
+  /// TOML entries {address, value, width}. Empty unless a title opts in ->
+  /// byte-identical for every existing project.
+  struct GuestPatch {
+    uint32_t address = 0;
+    uint64_t value = 0;
+    uint8_t width = 4;  ///< bytes: 1, 2, 4 or 8 (big-endian in guest memory)
+  };
+  std::vector<GuestPatch> guestPatches;
   uint32_t longJmpAddress = 0;
   uint32_t setJmpAddress = 0;
 

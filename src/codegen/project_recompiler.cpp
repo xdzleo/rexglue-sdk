@@ -192,6 +192,33 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
                      fmt::format("Failed to load entrypoint XEX: {:#x}", rtStatus));
   }
 
+  // Apply [[guest_patches]] to the freshly loaded guest image BEFORE any
+  // analysis: the disassembler and codegen then see the patched instructions,
+  // so community game-patch fixes (xenia-canary game-patches semantics) are
+  // baked permanently into the recompiled native code. Big-endian writes,
+  // matching the guest's byte order.
+  {
+    const auto& gpatches = targeted[0].config.guestPatches;
+    for (const auto& gp : gpatches) {
+      uint8_t* host = runtime->memory()->TranslateVirtual(gp.address);
+      if (!host) {
+        return Err<void>(ErrorCategory::Validation,
+                         fmt::format("[[guest_patches]] address 0x{:08X} not mapped", gp.address));
+      }
+      switch (gp.width) {
+        case 1: *host = static_cast<uint8_t>(gp.value); break;
+        case 2: rex::memory::store_and_swap<uint16_t>(host, static_cast<uint16_t>(gp.value)); break;
+        case 4: rex::memory::store_and_swap<uint32_t>(host, static_cast<uint32_t>(gp.value)); break;
+        case 8: rex::memory::store_and_swap<uint64_t>(host, gp.value); break;
+        default: break;
+      }
+    }
+    if (!gpatches.empty()) {
+      REXCODEGEN_TRACE("Applied {} guest patch write(s) to the image before analysis",
+                       gpatches.size());
+    }
+  }
+
   std::vector<rex::system::object_ref<rex::system::UserModule>> dllModules;
   for (size_t i = 1; i < targeted.size(); ++i) {
     const auto& dllConfig = targeted[i].config;

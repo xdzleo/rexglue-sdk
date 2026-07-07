@@ -327,6 +327,37 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
                      cfg.forcedLandings.size() - before, cfg.forcedLandings.size());
   }
 
+  // [[guest_patches]] -- community game-patch style byte writes into the loaded
+  // guest image, applied before analysis so the recompiled code is born patched.
+  if (auto patchArray = toml["guest_patches"].as_array()) {
+    for (auto& entry : *patchArray) {
+      auto* table = entry.as_table();
+      if (!table) {
+        REXCODEGEN_ERROR("Invalid [[guest_patches]] entry: expected table");
+        continue;
+      }
+      auto address_opt = (*table)["address"].value<int64_t>();
+      auto value_opt = (*table)["value"].value<int64_t>();
+      auto width_opt = (*table)["width"].value<int64_t>();
+      if (!address_opt || !value_opt) {
+        REXCODEGEN_ERROR("Missing 'address'/'value' in [[guest_patches]] entry");
+        continue;
+      }
+      RecompilerConfig::GuestPatch gp;
+      gp.address = static_cast<uint32_t>(*address_opt);
+      gp.value = static_cast<uint64_t>(*value_opt);
+      gp.width = width_opt ? static_cast<uint8_t>(*width_opt) : 4;
+      if (gp.width != 1 && gp.width != 2 && gp.width != 4 && gp.width != 8) {
+        REXCODEGEN_ERROR("Invalid 'width' {} in [[guest_patches]] at 0x{:08X} (1/2/4/8)",
+                         gp.width, gp.address);
+        continue;
+      }
+      cfg.guestPatches.push_back(gp);
+      REXCODEGEN_DEBUG("[config]   [[guest_patches]] 0x{:08X} <- 0x{:X} ({} bytes)", gp.address,
+                       gp.value, gp.width);
+    }
+  }
+
   // [[midasm_hook]] -- keyed by "address"
   if (auto midAsmHookArray = toml["midasm_hook"].as_array()) {
     for (auto& entry : *midAsmHookArray) {
