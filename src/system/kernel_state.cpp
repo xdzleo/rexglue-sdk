@@ -908,6 +908,16 @@ void KernelState::RegisterThread(XThread* thread) {
   // XThread::InitializeGuestObject and XThread::Exit.
 }
 
+bool KernelState::HasRunningGuestThreads() {
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& [id, thread] : threads_by_id_) {
+    if (thread->is_guest_thread() && thread->is_running()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void KernelState::UnregisterThread(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = threads_by_id_.find(thread->thread_id());

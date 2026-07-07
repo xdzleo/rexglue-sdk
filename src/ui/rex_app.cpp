@@ -684,6 +684,21 @@ void ReXApp::LaunchModule() {
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
       main_thread->Wait(0, 0, 0, nullptr);
       OnGuestThreadExit(main_thread.get());
+      // Xbox semantics: the title keeps running while any guest thread lives.
+      // Some titles' primary thread hands off to worker threads and exits
+      // (e.g. 565507E4 Crash of the Titans); quitting here killed them ~0.4s
+      // into boot. Only quit once no guest-created thread remains (title
+      // ended or called XamLoaderTerminateTitle, which kills them all).
+      if (runtime_ && runtime_->kernel_state() &&
+          runtime_->kernel_state()->HasRunningGuestThreads()) {
+        REXLOG_INFO(
+            "Entry-point thread exited; guest worker threads still running - "
+            "title continues");
+        while (!shutting_down_.load(std::memory_order_acquire) &&
+               runtime_->kernel_state()->HasRunningGuestThreads()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      }
       REXLOG_INFO("Execution complete");
       if (!shutting_down_.load(std::memory_order_acquire)) {
         app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });

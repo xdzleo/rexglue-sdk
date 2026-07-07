@@ -276,6 +276,10 @@ class KernelState {
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
+  // True while any guest-created (title) thread is still registered. Runtime
+  // service threads (XHostThread: XMA decoder, audio worker, GPU, dispatch)
+  // don't count.
+  bool HasRunningGuestThreads();
   void OnThreadExecute(XThread* thread);
   void OnThreadExit(XThread* thread);
   object_ref<XThread> GetThreadByID(uint32_t thread_id);
