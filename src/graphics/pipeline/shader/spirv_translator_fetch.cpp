@@ -1071,7 +1071,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id& coordinate_ref = coordinates[i];
         spv::Id component_offset =
             offset_values[i] ? builder_->makeFloatConstant(offset_values[i]) : spv::NoResult;
-        if (component_offset != spv::NoResult && texture_resolution_scaled != spv::NoResult &&
+        // Only the UNNORMALIZED path keeps the offset in guest-texel units and
+        // therefore needs the draw_resolution_scale revert. For NORMALIZED
+        // coordinates the offset is divided by the GUEST fetch-constant size
+        // below (size_component is never scaled to host in the regular fetch
+        // path), so offset/guest_size is already the scale-invariant normalized
+        // displacement; reverting it again would double-apply the scale and
+        // leave a fixed (1 - 1/scale) sub-texel bias on scaled intermediates at
+        // scale>1 (e.g. Gears of War 3 SSAO, 4D5308AB, the greenish edge halo),
+        // while scale==1 stays correct. Mirror of dxbc_translator_fetch.cpp.
+        if (instr.attributes.unnormalized_coordinates &&
+            component_offset != spv::NoResult && texture_resolution_scaled != spv::NoResult &&
             (revert_resolution_scale_axes & (UINT32_C(1) << i))) {
           spv::Id component_offset_resolution_scaled =
               builder_->createNoContractionBinOp(spv::OpFMul, type_float_, component_offset,

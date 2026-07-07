@@ -1090,23 +1090,21 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_offsets),
                  offsets_src, dxbc::Src::R(size_and_is_3d_temp));
         if (normalized_components_with_scaled_offsets) {
-          // Using coord_and_sampler_temp.w as a temporary for the needed
-          // resolution scale inverse - sampler not loaded yet.
-          a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
-                   LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
-                                      offsetof(SystemConstants, textures_resolution_scaled),
-                                      dxbc::Src::kXXXX),
-                   dxbc::Src::LU(uint32_t(1) << tfetch_index));
-          a_.OpIf(true, dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
-          a_.OpMAd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
-                   dxbc::Src::R(coord_and_sampler_temp),
-                   dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_,
-                                 1.0f, 1.0f),
-                   coord_operand);
-          a_.OpElse();
+          // For NORMALIZED coordinates the offset was just divided by the GUEST
+          // texture size (size_and_is_3d_temp is the unscaled fetch-constant
+          // size - the regular fetch path, unlike getTextureWeights, never
+          // multiplies it by draw_resolution_scale). offset/guest_size is
+          // therefore already the correct scale-invariant normalized
+          // displacement for a guest texel. Dividing it again by
+          // draw_resolution_scale (as the old scaled branch did) double-applies
+          // the revert, shifting every tap by (1 - 1/scale) of the rounding
+          // epsilon at scale>1 while leaving scale==1 correct - a fixed
+          // sub-texel bias on scaled intermediates (e.g. Gears of War 3 SSAO,
+          // 4D5308AB, the greenish edge halo). Add the already-normalized offset
+          // as-is, matching the non-scaled path. Only the unnormalized branch
+          // (coords in guest-texel units) legitimately reverts the scale.
           a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
                    coord_operand, dxbc::Src::R(coord_and_sampler_temp));
-          a_.OpEndIf();
         }
         if (normalized_components_with_unscaled_offsets) {
           a_.OpAdd(
