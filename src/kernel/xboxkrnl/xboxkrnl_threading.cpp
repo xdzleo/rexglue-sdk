@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -35,7 +37,9 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 #include <rex/system/xtypes.h>
+#include <rex/ppc/context.h>
 #include <rex/thread/atomic.h>
+#include <rex/thread/fiber.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::kernel::xboxkrnl {
@@ -264,6 +268,56 @@ void UpdateGuestStackPointers(X_KTHREAD* kthread, X_KPCR* pcr, PPCContext* ctx, 
   ctx->r1.u64 = sp;
 }
 
+// Green-thread bridge for titles that run their own in-engine scheduler on
+// raw KeSetCurrentStackPointers (+ MmCreateKernelStack), never touching the
+// XAPI fiber surface (565507E4 Crash of the Titans). The previous
+// Reenter-unwind (throw to XThread::Execute, re-enter at the new LR) only
+// works for contexts that always switch away again: it destroys the host
+// frames of the suspended chain, so a context that later RETURNS UP its own
+// guest call chain (epilogue+blr at the resume site) host-returns into
+// Execute's loop and the thread silently exits. CoT's boot orchestrator died
+// exactly this way ~0.4s in (resume LR 0x82288D04 = yield epilogue), leaving
+// 17 worker threads parked forever: black screen, silence, zero GPU packets.
+// Host fibers preserve the entire host stack across switches, so mid-chain
+// resume and chain-return both work. One fiber per guest context, keyed by
+// the context's guest stack_base (unique: each green thread gets its own
+// MmCreateKernelStack region).
+struct RawFiberBinding {
+  rex::thread::Fiber* fiber;
+  XThread* owner;
+};
+std::unordered_map<uint32_t, RawFiberBinding> raw_green_fibers_;
+std::mutex raw_green_fibers_mutex_;
+
+struct RawFiberArgs {
+  uint32_t resume_address;
+};
+
+void RawGreenFiberEntry(void* raw_arg) {
+  auto args = std::unique_ptr<RawFiberArgs>(static_cast<RawFiberArgs*>(raw_arg));
+  auto* thread = XThread::GetCurrentThread();
+  PPCContext* ctx = thread->thread_state()->context();
+  uint8_t* base = REX_KERNEL_MEMORY()->virtual_membase();
+  // First schedule of this guest context: execute from the resume address the
+  // switching-in SwapContext left in LR. Resume sites are usually
+  // MID-function (the return site of the context's own `bl SwapContext`), so
+  // resolution goes through ResolveIndirectFunction: an unregistered site
+  // funnels into the invalid-function trap the heal pipeline already cures.
+  ctx->last_indirect_target = args->resume_address;
+  PPCFunc* fn = rex::runtime::ResolveIndirectFunction(args->resume_address);
+  fn(*ctx, base);
+  // The context's entire guest chain returned: this green thread is done.
+  // Hand control back to the thread's root context; a green thread that ends
+  // its chain without switching away has nothing left to run here.
+  REXKRNL_WARN("green-thread chain at resume {:08X} fully returned; switching to main fiber",
+               args->resume_address);
+  if (thread->main_fiber()) {
+    rex::thread::Fiber::SwitchTo(thread->main_fiber());
+  }
+  REXKRNL_ERROR("green-thread chain returned with no main fiber - terminating");
+  std::terminate();
+}
+
 }  // namespace
 
 void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD> thread,
@@ -274,19 +328,69 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
 
+  const uint32_t old_stack_base = thread->stack_base;
+
   UpdateGuestStackPointers(thread, pcr, context, stack_ptr.guest_address(),
                            stack_alloc_base.value(), stack_base.value(), stack_limit.value());
 
-  // Guest fiber switch: the caller (the title's SwapContext) already saved the
-  // old fiber's registers and restored the new fiber's -- including LR, which
-  // now holds the new fiber's resume address. The host C++ call chain, however,
-  // still contains the OLD fiber's frames: returning through them would resume
-  // stale code on the new guest stack and grow the host stack on every switch.
-  // Unwind to XThread::Execute and re-enter guest code at the new LR (same as
-  // mainline Xenia). Gated on fiber_ptr: titles that never set up fibers
-  // (everything in the fleet before Korra) never take this path.
+  // Guest green-thread switch: the caller (the title's SwapContext) already
+  // saved the old context's registers and restored the new context's --
+  // including LR, which now holds the new context's resume address. The host
+  // C++ call chain, however, still contains the OLD context's frames.
+  // Suspend them in a host fiber (preserving them for a later switch-back)
+  // and resume/start the new context's fiber. Gated on fiber_ptr: titles
+  // that never set up fibers (everything in the fleet before Korra) never
+  // take this path, byte-for-byte identical behavior.
   if (thread->fiber_ptr && current_thread->guest_object() == thread.guest_address()) {
-    current_thread->Reenter(static_cast<uint32_t>(context->lr));
+    const uint32_t new_stack_base = stack_base.value();
+    if (new_stack_base == old_stack_base) {
+      // Stack pointers refreshed on the same context: not a switch.
+      return;
+    }
+
+    rex::thread::Fiber* self = rex::thread::Fiber::Current();
+    if (!self) {
+      self = rex::thread::Fiber::ConvertCurrentThread();
+      if (!current_thread->main_fiber()) {
+        current_thread->set_main_fiber(self);
+      }
+    }
+
+    rex::thread::Fiber* target = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(raw_green_fibers_mutex_);
+      // The outgoing chain suspends right here under its context's stack key.
+      raw_green_fibers_[old_stack_base] = {self, current_thread};
+      auto it = raw_green_fibers_.find(new_stack_base);
+      if (it != raw_green_fibers_.end()) {
+        if (it->second.owner == current_thread) {
+          target = it->second.fiber;
+        } else {
+          // Cross-thread green-thread migration: resuming another thread's
+          // suspended host fiber would run it with the wrong PPCContext/TLS.
+          // Not observed in practice (contexts are thread-affine in CoT);
+          // start a fresh chain on this thread instead.
+          REXKRNL_WARN(
+              "KeSetCurrentStackPointers: cross-thread green-thread resume of stack {:08X}; "
+              "starting fresh chain",
+              new_stack_base);
+        }
+      }
+      if (!target) {
+        auto* args = new RawFiberArgs{static_cast<uint32_t>(context->lr)};
+        target = rex::thread::Fiber::Create(256 * 1024, RawGreenFiberEntry, args);
+        raw_green_fibers_[new_stack_base] = {target, current_thread};
+      }
+    }
+
+    REXKRNL_DEBUG("green-thread switch: stack {:08X} -> {:08X} resume {:08X}", old_stack_base,
+                  new_stack_base, static_cast<uint32_t>(context->lr));
+    rex::thread::Fiber::SwitchTo(target);
+    // Resumed by a later switch-back into this context: the switching-in
+    // SwapContext already restored our registers and stack pointers. A plain
+    // return walks back through the recompiled frames preserved by this
+    // fiber, continuing the guest chain exactly where it left off (including
+    // chain-returns through the yield epilogue).
   }
 }
 
