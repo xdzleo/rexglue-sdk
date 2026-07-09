@@ -18,6 +18,8 @@
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 
@@ -143,6 +145,35 @@ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   return X_ERROR_SUCCESS;
 }
 
+namespace {
+// REX_AUTOPLAY=1: synthesize periodic START and A presses INSIDE the driver so
+// unattended heal/verification runs advance title and menu screens. Runtime-side
+// on purpose: OS-level input injection is unreliable (SDL maps by scancode, a
+// background process cannot steal foreground, and GetState zeroes input without
+// focus anyway) -- this path depends on none of that.
+uint16_t AutoplayButtons() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("REX_AUTOPLAY");
+    return v && *v && *v != '0';
+  }();
+  if (!enabled) {
+    return 0;
+  }
+  const uint64_t ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  const uint64_t phase = ms % 5000;  // 5s cycle
+  if (phase < 300) {
+    return X_INPUT_GAMEPAD_START;  // held ~300ms
+  }
+  if (phase >= 2500 && phase < 2800) {
+    return X_INPUT_GAMEPAD_A;
+  }
+  return 0;
+}
+}  // namespace
+
 X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (!IsEnabled()) {
     std::lock_guard lock(state_mutex_);
@@ -160,6 +191,12 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     ClearStateLocked();
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
+      // Autoplay works WITHOUT focus (the whole point: unattended runs).
+      const uint16_t auto_buttons = AutoplayButtons();
+      if (auto_buttons) {
+        out_state->gamepad.buttons = auto_buttons;
+        packet_number_++;
+      }
       out_state->packet_number = packet_number_;
     }
     return X_ERROR_SUCCESS;
@@ -223,6 +260,8 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
+
+  buttons |= AutoplayButtons();
 
   packet_number_++;
 
