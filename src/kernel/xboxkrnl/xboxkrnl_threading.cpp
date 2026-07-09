@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -141,6 +142,7 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
 
   // Stack must be aligned to 16kb pages
   actual_stack_size = std::max((uint32_t)0x4000, ((actual_stack_size + 0xFFF) & 0xFFFFF000));
+
 
   auto thread = object_ref<XThread>(new XThread(
       REX_KERNEL_STATE(), actual_stack_size, xapi_thread_startup, start_address.guest_address(),

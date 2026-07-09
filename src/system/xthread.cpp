@@ -15,6 +15,8 @@
 
 #include <fmt/format.h>
 
+#include <cstdlib>
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -274,6 +276,23 @@ void XThread::InitializeGuestObject() {
 }
 
 bool XThread::AllocateStack(uint32_t size) {
+  // Minimum guest-thread stack floor (covers EVERY thread: main/entry, kernel
+  // dispatch, ExCreateThread). Some titles run a thread on a thin XEX-default
+  // stack and blow it deep in native code -- Halo 3 overflows during the Waves
+  // audio DLLs' module init. Retail HW tolerated the overshoot; our guard pages
+  // make it a hard AV. Clamp small stacks up; threads already asking for more
+  // are untouched. REX_MIN_STACK_KB=N overrides (0 disables). Codegen unaffected.
+  {
+    uint32_t floor_kb = 512;
+    if (const char* v = std::getenv("REX_MIN_STACK_KB")) {
+      floor_kb = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    }
+    const uint32_t floor = floor_kb * 1024;
+    if (floor && size < floor) {
+      size = floor;
+    }
+  }
+
   auto heap = memory()->LookupHeap(kStackAddressRangeBegin);
 
   auto alignment = heap->page_size();
