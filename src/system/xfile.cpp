@@ -37,7 +37,18 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
+  // Honor FILE_DISPOSITION delete-on-close (NtSetInformationFile
+  // XFileDispositionInformation). The flag used to be recorded and never read:
+  // the file survived its close, so titles that delete-and-recreate a cache
+  // file spun forever -- Halo 3's font cache loops on font_package.bin
+  // (create -> mark delete-on-close -> close -> stale file collides -> retry),
+  // 4000+ retries/min with a black screen.
+  auto* ent = file_->entry();
+  bool delete_after = ent && ent->delete_on_close();
   file_->Destroy();
+  if (delete_after) {
+    ent->Delete();
+  }
 }
 
 uint64_t XFile::position() const {

@@ -149,14 +149,20 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       break;
     }
     case XFileXctdCompressionInformation: {
-      REXKRNL_ERROR(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      // Truthful answer for this runtime: NOT XCTD-compressed. The rexauto
+      // pipeline's xctd stage statically decodes every 0x0FF512ED container on
+      // disk before the game ever runs (originals preserved in xctd_originals/),
+      // so runtime files are always plain data. The old INVALID_PARAMETER made
+      // titles that probe before reading retry forever -- Bully re-queried 913x
+      // and never left its streaming loop; Ms. Splosion Man probes on every
+      // .xpr open. (A title shipped OUTSIDE the rexauto flow with a still-
+      // compressed file would mis-read it -- but it errored before this change
+      // too, just less honestly.)
+      auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+      info->unknown = 0;
+      out_length = sizeof(*info);
+      REXKRNL_DEBUG("XFileXctdCompressionInformation('{}') -> not compressed",
+                    file->path());
       break;
     };
     case XFileNetworkOpenInformation: {
@@ -430,11 +436,15 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
       break;
     }
     case XFileFsDeviceInformation: {
+      // Answer with a real device instead of FILE_DEVICE_UNKNOWN: every mounted
+      // volume in this runtime is backed by host storage, i.e. a fixed disk.
+      // GTA V's install-partition detection walks its volumes and rejects
+      // FILE_DEVICE_UNKNOWN, blocking its content install path.
       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
-      REXKRNL_WARN("Stub XFileFsDeviceInformation!");
-      info->device_type = FILE_DEVICE_UNKNOWN;
+      info->device_type = FILE_DEVICE_DISK;
       info->characteristics = 0;
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
+      REXKRNL_DEBUG("XFileFsDeviceInformation -> FILE_DEVICE_DISK");
       break;
     }
     default: {

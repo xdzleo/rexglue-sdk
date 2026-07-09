@@ -489,9 +489,24 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
       }
 
       if (resolvedName.empty()) {
-        REXCODEGEN_ERROR("Cannot resolve ordinal {} from {}", ordinal, lib_name);
-        resolvedName = fmt::format("sub_{:X}", sym.address);
+        // Import from a library the export resolver doesn't know -- for a
+        // multi-XEX title this is a SIBLING GUEST MODULE (Halo 3's L360.dll
+        // imports from WavesLibDLL.dll), not a kernel export. Do NOT register
+        // an extern IMPORT node (it would emit an undefined, unprefixed symbol
+        // and no definition -> link error). Instead skip registration entirely:
+        // the import THUNK code exists in the image and normal discovery
+        // recompiles it as plain guest code; at load time the XEX loader binds
+        // the IAT slot in guest memory, so the recompiled thunk's indirect
+        // branch resolves through the global multi-module dispatcher to the
+        // sibling's recompiled function. Titles whose imports all resolve
+        // (every single-module fleet title) never reach this branch ->
+        // codegen byte-identical.
+        REXCODEGEN_WARN(
+            "Unresolved import ordinal {} from {} -- treating its thunk as "
+            "plain guest code (sibling-module import)",
+            ordinal, lib_name);
         unresolvedCount++;
+        continue;
       }
 
       auto* node = graph.addImportFunction(sym.address, resolvedName);

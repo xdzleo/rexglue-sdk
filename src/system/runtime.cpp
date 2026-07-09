@@ -349,6 +349,27 @@ bool Runtime::SetupVfs() {
     } else {
       REXSYS_WARN("  cache: mount failed ({}); title cache reads will 0xC000000F", cache_host.string());
     }
+    // cache0: / cache1: -- the 360's two utility/scratch partitions, distinct
+    // from cache: above. Halo 3 streams its maps through cache0:/cache1: and
+    // shows XamShowDirtyDiscErrorUI after ~200 failed opens ("device not
+    // found") when only cache: exists. Same writable HostPathDevice recipe,
+    // separate host subdirs so titles that use both see two devices.
+    for (int cache_i = 0; cache_i < 2; ++cache_i) {
+      std::filesystem::path ci_host = !cache_root_.empty()
+                                          ? (cache_root_ / (cache_i ? "guest_cache1" : "guest_cache0"))
+                                          : (abs_game_root.parent_path() / (cache_i ? "cache1" : "cache0"));
+      std::string ci_mount =
+          cache_i ? "\Device\Harddisk0\PartitionCache1" : "\Device\Harddisk0\PartitionCache0";
+      std::string ci_link = cache_i ? "cache1:" : "cache0:";
+      auto ci_device = std::make_unique<rex::filesystem::HostPathDevice>(
+          ci_mount, ci_host, /*read_only=*/false);
+      if (ci_device->Initialize() && file_system_->RegisterDevice(std::move(ci_device))) {
+        file_system_->RegisterSymbolicLink(ci_link, ci_mount);
+        REXSYS_INFO("  Mounted writable {} at {}", ci_host.string(), ci_link);
+      } else {
+        REXSYS_WARN("  {} mount failed ({})", ci_link, ci_host.string());
+      }
+    }
   }
 
   return true;
