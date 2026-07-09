@@ -23,6 +23,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/fps_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/ui/overlay/simple_settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -44,6 +45,13 @@
 #if REX_PLATFORM_LINUX
 #include <gnu/libc-version.h>
 #include <sys/utsname.h>
+#endif
+
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
 #endif
 
 #include <fmt/format.h>
@@ -70,6 +78,36 @@ constexpr bool kBlockShaderStorageStartup =
 #else
     false;
 #endif
+
+// Relaunch the current executable with the same command line. Used by the
+// in-game settings menu to apply changes that require a restart (resolution
+// scale reallocates the whole EDRAM/render-target chain, so it cannot be
+// hot-swapped - same on stock Xenia). The new instance reads the config the
+// menu just saved next to the exe.
+bool RelaunchSelf() {
+#if REX_PLATFORM_WIN32
+  wchar_t exe_path[MAX_PATH];
+  DWORD n = ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return false;
+  }
+  // GetCommandLineW includes argv[0]; reuse it verbatim so all launch args
+  // (--game_data_root, etc.) carry over.
+  std::wstring cmdline = ::GetCommandLineW();
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!::CreateProcessW(exe_path, cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
+                        &pi)) {
+    return false;
+  }
+  ::CloseHandle(pi.hThread);
+  ::CloseHandle(pi.hProcess);
+  return true;
+#else
+  return false;
+#endif
+}
 
 #if REX_PLATFORM_LINUX
 std::string Trim(std::string value) {
@@ -208,6 +246,9 @@ void StartForcedExitWatchdog(const char* reason) {
 
 REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
                     "Enable the developer cvar browser on F4");
+
+REXCVAR_DEFINE_BOOL(simple_settings_overlay_enabled, true, "UI",
+                    "Enable the in-game settings menu (resolution, framerate, etc.) on F1");
 
 REXCVAR_DEFINE_BOOL(show_fps_counter, false, "UI", "Show the guest FPS counter overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -644,6 +685,33 @@ bool ReXApp::SetupPresentation() {
           }
         });
 
+        // In-game settings menu (resolution / framerate / etc.) - the curated,
+        // user-facing overlay (same one the Skate 3 community build ships).
+        // Created once; F1 toggles it (F2/F3/F4/Backtick are already bound).
+        // Resolution changes are saved to the per-title config and applied via
+        // a self-relaunch ("Apply & Restart").
+        if (REXCVAR_GET(simple_settings_overlay_enabled)) {
+          simple_settings_overlay_ = std::make_unique<ui::SimpleSettingsDialog>(
+              imgui_drawer_.get(), config_path_,
+              /*load_profiles=*/[]() { return ui::SimpleProfileState{}; },
+              /*save_profile=*/[](int, std::string, bool) {},
+              /*close_settings=*/[] {},
+              /*close_game=*/[this] { app_context().RequestDeferredQuit(); },
+              /*restart_game=*/
+              [this] {
+                if (RelaunchSelf()) {
+                  app_context().RequestDeferredQuit();
+                } else {
+                  REXLOG_ERROR("Settings: failed to relaunch for restart");
+                }
+              });
+          rex::ui::RegisterBind("bind_game_settings", "F1", "Toggle in-game settings menu", [this] {
+            if (simple_settings_overlay_) {
+              simple_settings_overlay_->Toggle();
+            }
+          });
+        }
+
         OnCreateDialogs(imgui_drawer_.get());
       }
     }
@@ -756,8 +824,10 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  rex::ui::UnregisterBind("bind_game_settings");
 
   // ImGui cleanup (reverse of setup)
+  simple_settings_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
