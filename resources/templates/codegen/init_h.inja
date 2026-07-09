@@ -22,7 +22,8 @@
 #define REX_CODE_BASE {{ code_base }}ull
 #define REX_CODE_SIZE {{ code_size }}ull
 #define REX_THUNK_RESERVE_SIZE {{ thunk_reserve_size }}ull
-
+{% if exists("function_table_base") %}#define REX_FUNC_TABLE_BASE {{ function_table_base }}ull
+{% endif %}
 #define REXCRT_HEAP {% if rexcrt_heap %}1{% else %}0{% endif %}
 
 //=============================================================================

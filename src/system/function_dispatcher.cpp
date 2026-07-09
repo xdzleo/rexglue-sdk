@@ -198,7 +198,8 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
 
 bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
                                                  uint32_t image_base, uint32_t image_size,
-                                                 bool is_entrypoint) {
+                                                 bool is_entrypoint,
+                                                 uint32_t function_table_base) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
 
   if (is_entrypoint && entrypoint_code_base_ != 0) {
@@ -207,16 +208,35 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     return false;
   }
 
-  uint32_t new_table_end = image_base + image_size + (code_size + kThunkReserveSize) * 2;
+  // Resolve the dispatch-table placement: legacy default right after the image,
+  // or the module's explicit override (needed when another module's image loads
+  // right after this one -- with the default, the table itself would overlap it).
+  const uint32_t table_base =
+      function_table_base ? function_table_base : image_base + image_size;
+  const uint32_t table_size = (code_size + kThunkReserveSize) * 2;
   uint32_t new_code_end = code_base + code_size + kThunkReserveSize;
+  // Overlap checks against every registered module, as SEPARATE image and table
+  // ranges (the old contiguous [image_base, image+table) blob is only correct
+  // when the table sits at image_base + image_size; with an override the two
+  // ranges are disjoint). For legacy modules image+table are adjacent, so the
+  // pairwise checks are exactly equivalent to the old single-blob check.
   for (const auto& existing : module_tables_) {
-    uint32_t existing_table_end =
-        existing.image_base + existing.image_size + (existing.code_size + kThunkReserveSize) * 2;
+    const uint32_t existing_table_size = (existing.code_size + kThunkReserveSize) * 2;
     uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
-    if (image_base < existing_table_end && new_table_end > existing.image_base) {
-      REXLOG_ERROR("Module image range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
-                   image_base, new_table_end, existing.image_base, existing_table_end);
-      return false;
+    struct Range { uint32_t lo, hi; const char* what; };
+    const Range mine[] = {{image_base, image_base + image_size, "image"},
+                          {table_base, table_base + table_size, "table"}};
+    const Range theirs[] = {
+        {existing.image_base, existing.image_base + existing.image_size, "image"},
+        {existing.table_base, existing.table_base + existing_table_size, "table"}};
+    for (const auto& a : mine) {
+      for (const auto& b : theirs) {
+        if (a.lo < b.hi && a.hi > b.lo) {
+          REXLOG_ERROR("Module {} range [{:08X}, {:08X}) overlaps existing {} [{:08X}, {:08X})",
+                       a.what, a.lo, a.hi, b.what, b.lo, b.hi);
+          return false;
+        }
+      }
     }
     if (code_base < existing_code_end && new_code_end > existing.code_base) {
       REXLOG_ERROR("Module code range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
@@ -225,7 +245,7 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     }
   }
 
-  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size)) {
+  if (!memory_->InitializeFunctionTable(code_base, code_size, table_base)) {
     REXLOG_ERROR("Failed to initialize guest memory function table");
     return false;
   }
@@ -235,6 +255,7 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
       .code_size = code_size,
       .image_base = image_base,
       .image_size = image_size,
+      .table_base = table_base,
       .next_thunk_address = code_base + code_size,
       .thunk_limit = code_base + code_size + kThunkReserveSize,
   });
@@ -243,8 +264,10 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     entrypoint_code_base_ = code_base;
   }
 
-  REXLOG_INFO("Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}",
-              code_base, code_base + code_size, image_base, image_base + image_size);
+  REXLOG_INFO("Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}, "
+              "table={:08X}-{:08X}{}",
+              code_base, code_base + code_size, image_base, image_base + image_size, table_base,
+              table_base + table_size, function_table_base ? " (explicit base)" : "");
   return true;
 }
 

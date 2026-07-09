@@ -127,6 +127,9 @@ struct RecompilerConfig {
   std::vector<GuestPatch> guestPatches;
   uint32_t longJmpAddress = 0;
   uint32_t setJmpAddress = 0;
+  /// Optional guest VA override for the module's function-pointer dispatch table
+  /// (manifest key function_table_base). 0 = legacy image_base + image_size.
+  uint32_t functionTableBase = 0;
 
   // === rexcrt: CRT function address overrides ===
   // Maps function name -> guest address (e.g. "CreateFileA" -> 0x8248B780)

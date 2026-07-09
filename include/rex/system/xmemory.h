@@ -523,11 +523,11 @@ class Memory {
   //==========================================================================
   // Recompiled Code Function Table API
   //==========================================================================
-  // Per-module function dispatch table at IMAGE_BASE + IMAGE_SIZE, indexed by
-  // (guest_addr - code_base) * 2. Internally locked: callers may invoke from
-  // any thread.
-  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                               uint32_t image_size);
+  // Per-module function dispatch table at table_base (the dispatcher resolves it:
+  // legacy IMAGE_BASE + IMAGE_SIZE, or the module's explicit function_table_base
+  // override), indexed by (guest_addr - code_base) * 2. Internally locked:
+  // callers may invoke from any thread.
+  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t table_base);
   bool DestroyFunctionTable(uint32_t code_base);
   // Returns false if guest_address is outside every registered module range.
   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);

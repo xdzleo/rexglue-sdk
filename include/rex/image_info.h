@@ -35,6 +35,13 @@ struct PPCImageInfo {
   const PPCFuncMapping* func_mappings;
   bool rexcrt_heap = false;  ///< Set by codegen when [rexcrt] has heap functions
   RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects
+  /// Guest VA of the module's function-pointer dispatch table; 0 = legacy default
+  /// (image_base + image_size). Set by codegen when the manifest overrides
+  /// function_table_base -- needed when another recompiled module's image loads
+  /// right after this one (e.g. FIFA Street's companion at 0x82300000) and would
+  /// collide with the default table placement. Appended last: older generated
+  /// init.cpp default-initializes it to 0 (legacy) under the new header.
+  u32 function_table_base = 0;
 };
 
 }  // namespace rex

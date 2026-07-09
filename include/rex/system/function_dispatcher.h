@@ -69,11 +69,18 @@ class FunctionDispatcher : public IModuleRegistrar {
   // Shared thunk region size per module.
   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
 
-  // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE)
+  // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE,
+  // or at an explicit function_table_base when the module's manifest overrides it --
+  // needed when another module's image loads right after this one and would collide
+  // with the default placement, e.g. FIFA Street's companion at 0x82300000).
   // Set is_entrypoint=true exactly once for the host-loaded entrypoint so
   // AllocateThunk(caller_address=0) can route to its pool.
+  // function_table_base=0 keeps the legacy image_base + image_size placement.
+  // Appended AFTER is_entrypoint: an existing positional `true` 5th arg keeps
+  // meaning is_entrypoint (inserting before it would silently reinterpret it).
   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                               uint32_t image_size, bool is_entrypoint = false);
+                               uint32_t image_size, bool is_entrypoint = false,
+                               uint32_t function_table_base = 0);
   bool SetFunction(uint32_t guest_address, ::PPCFunc* func) override;
   ::PPCFunc* GetFunction(uint32_t guest_address);
   bool HasAnyFunctionTable() const { return !module_tables_.empty(); }
@@ -112,6 +119,7 @@ class FunctionDispatcher : public IModuleRegistrar {
     uint32_t code_size;
     uint32_t image_base;
     uint32_t image_size;
+    uint32_t table_base;  ///< resolved dispatch-table guest VA (never 0 once stored)
     uint32_t next_thunk_address;
     uint32_t thunk_limit;
   };

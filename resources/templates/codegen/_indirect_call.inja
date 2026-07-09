@@ -16,9 +16,11 @@
 #define REX_PROFILE_INDIRECT_DISPATCH()
 #endif
 
-#define REX_LOOKUP_FUNC(x, y) \
+{% if exists("function_table_base") %}#define REX_LOOKUP_FUNC(x, y) \
+  (*(PPCFunc**)(x + REX_FUNC_TABLE_BASE + (u64(u32(y) - REX_CODE_BASE) * 2)))
+{% else %}#define REX_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
-
+{% endif %}
 // NOTE: last_indirect_target must be written UNCONDITIONALLY. Table slots for
 // unregistered code hold the InvalidFunctionTrap (non-null), so the likely
 // path calls the trap directly without ever reaching the fallback branch —

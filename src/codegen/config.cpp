@@ -138,6 +138,10 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
     uint32_t addr = static_cast<uint32_t>(*v);
     MergeScalar(cfg.setJmpAddress, addr, "setjmp_address");
   }
+  if (auto v = toml["function_table_base"].value<int64_t>()) {
+    uint32_t addr = static_cast<uint32_t>(*v);
+    MergeScalar(cfg.functionTableBase, addr, "function_table_base");
+  }
 
   // --- [analysis] section scalars ---
   if (auto* analysisTable = toml["analysis"].as_table()) {
@@ -569,6 +573,13 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
   // Check special address alignment
   checkAlignment(longJmpAddress, "longjmp");
   checkAlignment(setJmpAddress, "setjmp");
+  // The dispatch table is allocated with AllocFixed(alignment=0x10000) -- an
+  // unaligned override would fail at runtime, so reject it at codegen time.
+  if (functionTableBase != 0 && (functionTableBase & 0xFFFF) != 0) {
+    result.errors.push_back(fmt::format(
+        "function_table_base 0x{:08X} is not 64KiB aligned", functionTableBase));
+    result.valid = false;
+  }
 
   for (const auto& [name, addr] : rexcrtFunctions) {
     if (addr & 0x3) {

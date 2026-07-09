@@ -16,6 +16,8 @@ const rex::PPCImageInfo {{ project }}_PPCImageConfig = {
     .rexcrt_heap = REXCRT_HEAP,
 {% if has_dll_modules and not is_dll %}
     .register_modules = RegisterRecompiledModules,
+{% endif %}{% if exists("function_table_base") %}
+    .function_table_base = REX_FUNC_TABLE_BASE,
 {% endif %}
 };
 

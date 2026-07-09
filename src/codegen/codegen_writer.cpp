@@ -89,7 +89,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
   };
 
-  return {
+  nlohmann::json data = {
       {"project", cfg.projectName},
       {"image_base", fmt::format("0x{:X}", ctx.binary().baseAddress())},
       {"image_size", fmt::format("0x{:X}", ctx.binary().imageSize())},
@@ -103,6 +103,14 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"functions", functionsJson},
       {"recomp_files", nlohmann::json::array()},
   };
+  // Present ONLY when the manifest overrides it: templates gate on
+  // exists("function_table_base"), so absent key -> zero bytes emitted -> every
+  // existing project's codegen stays byte-identical. (An always-present ""
+  // value is NOT safe: this inja build treats "" as truthy.)
+  if (cfg.functionTableBase) {
+    data["function_table_base"] = fmt::format("0x{:X}", cfg.functionTableBase);
+  }
+  return data;
 }
 
 }  // namespace
