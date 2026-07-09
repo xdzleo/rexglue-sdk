@@ -182,6 +182,12 @@ struct FiberInfo {
 
 class KernelState {
  public:
+  // Guard-page grace commit dispatcher: find the guest thread whose bottom
+  // stack guard page contains guest_addr and heal the overflow (one page, one
+  // time per thread). Installed as a global AV handler; returns true to retry
+  // the faulting instruction. See XThread::TryHealStackOverflow.
+  bool TryHealGuestStackOverflow(uint32_t guest_addr);
+
   explicit KernelState(Runtime* emulator);
   ~KernelState();
 

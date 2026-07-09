@@ -4693,6 +4693,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
             return false;
           default:
+            // Non-vertex fetch-constant types (kTexture / kInvalidTexture) used
+            // to be unconditionally fatal, killing EVERY draw of titles whose
+            // shaders vfetch through a texture-typed constant -- Ms. Splosion
+            // Man (58410B19, both ports) and Forza Horizon (tess_mode=1 draws)
+            // never presented a single frame. The address is a 30-bit dword
+            // field (always inside guest space), so under the same opt-out
+            // cvar decode it as vertex data, like kInvalidVertex above.
+            if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+              REXGPU_WARN(
+                  "Vertex fetch constant {} ({:08X} {:08X}) has non-vertex type "
+                  "-- decoding as vertex data",
+                  vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+              break;
+            }
             REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                         vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
             return false;

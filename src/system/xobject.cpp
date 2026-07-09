@@ -365,6 +365,14 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
 object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type) {
   assert_not_null(native_ptr);
+  // Guest code passes NULL dispatcher objects on its own error paths (Superman
+  // Returns: NULL XMA-context event fields ~67s in). In release builds the
+  // assert above compiles out and the header deref below turned a guest-visible
+  // failure into a host access violation. Every caller already handles a null
+  // return as the graceful error path.
+  if (!native_ptr) {
+    return nullptr;
+  }
 
   // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
   // we never see it and just randomly start getting passed events/timers/etc.

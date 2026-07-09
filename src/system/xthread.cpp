@@ -304,6 +304,32 @@ bool XThread::AllocateStack(uint32_t size) {
   return true;
 }
 
+bool XThread::TryHealStackOverflow(uint32_t guest_addr) {
+  // Bottom guard page = [stack_alloc_base_, stack_limit_) (see AllocateStack).
+  if (stack_grace_used_ || !stack_alloc_base_) {
+    return false;
+  }
+  if (guest_addr < stack_alloc_base_ || guest_addr >= stack_limit_) {
+    return false;
+  }
+  auto heap = memory()->LookupHeap(kStackAddressRangeBegin);
+  if (!heap) {
+    return false;
+  }
+  const uint32_t guard_size = stack_limit_ - stack_alloc_base_;
+  if (!heap->Protect(stack_alloc_base_, guard_size,
+                     memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+    return false;
+  }
+  stack_grace_used_ = true;
+  stack_limit_ = stack_alloc_base_;
+  REXSYS_ERROR(
+      "guest stack overflow HEALED: thread {:08X} grew {} bytes into its guard "
+      "page at {:08X} (one-shot; a deeper overflow stays fatal)",
+      handle(), guard_size, stack_alloc_base_);
+  return true;
+}
+
 void XThread::FreeStack() {
   if (stack_alloc_base_) {
     auto heap = memory()->LookupHeap(kStackAddressRangeBegin);

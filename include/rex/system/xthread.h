@@ -306,6 +306,14 @@ class reenter_exception {
 
 class XThread : public XObject {
  public:
+  // Guard-page grace commit: heal a hair-thin guest stack overflow into the
+  // stack's own bottom guard page (one page, ONE time per thread) instead of
+  // dying. Retail hardware tolerated small overshoots by trampling adjacent
+  // memory; our NoAccess guard turns them into hard AVs -- Halo 3's Waves L360
+  // DSP thread overflows its 64KiB XEX-default stack by exactly 16 bytes.
+  // Returns true if guest_addr was in this thread's bottom guard page and the
+  // page was committed (caller retries the faulting instruction).
+  bool TryHealStackOverflow(uint32_t guest_addr);
   static const XObject::Type kObjectType = XObject::Type::Thread;
 
   static constexpr uint32_t kStackAddressRangeBegin = 0x70000000;
@@ -429,6 +437,7 @@ class XThread : public XObject {
   uint32_t tls_dynamic_address_ = 0;
   uint32_t tls_total_size_ = 0;
   uint32_t pcr_address_ = 0;
+  bool stack_grace_used_ = false;  // one-shot guard-page grace commit consumed
   uint32_t stack_alloc_base_ = 0;  // Stack alloc base
   uint32_t stack_alloc_size_ = 0;  // Stack alloc size
   uint32_t stack_base_ = 0;        // High address

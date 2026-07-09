@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -48,6 +49,40 @@ KernelState* kernel_state() {
   return shared_kernel_state_;
 }
 
+namespace {
+// Global AV handler for the guest-stack guard-page grace commit. Claims ONLY
+// access violations whose guest address falls inside a registered thread's
+// bottom guard page; everything else falls through to the next handler
+// (MMIO/write-watch) untouched.
+bool GuestStackOverflowHandlerThunk(rex::arch::Exception* ex, void* data) {
+  if (ex->code() != rex::arch::Exception::Code::kAccessViolation) {
+    return false;
+  }
+  auto* kernel_state = static_cast<KernelState*>(data);
+  auto* mem = kernel_state->memory();
+  const uint64_t host = ex->fault_address();
+  const uint64_t base = reinterpret_cast<uint64_t>(mem->virtual_membase());
+  if (host < base || host - base >= 0x100000000ull) {
+    return false;
+  }
+  const uint32_t guest = static_cast<uint32_t>(host - base);
+  if (guest < XThread::kStackAddressRangeBegin || guest >= XThread::kStackAddressRangeEnd) {
+    return false;
+  }
+  return kernel_state->TryHealGuestStackOverflow(guest);
+}
+}  // namespace
+
+bool KernelState::TryHealGuestStackOverflow(uint32_t guest_addr) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& [id, thread] : threads_by_id_) {
+    if (thread && thread->TryHealStackOverflow(guest_addr)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 KernelState::KernelState(Runtime* emulator)
     : emulator_(emulator),
       memory_(emulator->memory()),
@@ -65,6 +100,10 @@ KernelState::KernelState(Runtime* emulator)
     user_data_root = std::filesystem::absolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+
+  // Guest-stack guard-page grace commit (Halo 3 Waves DSP overflows its 64KiB
+  // XEX-default stack by 16 bytes; retail HW tolerated it).
+  rex::arch::ExceptionHandler::Install(GuestStackOverflowHandlerThunk, this);
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
@@ -153,6 +192,7 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+  rex::arch::ExceptionHandler::Uninstall(GuestStackOverflowHandlerThunk, this);
   app_manager_.reset();
 
   // Stop the dispatch thread before touching the object table
