@@ -271,10 +271,28 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it = std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-    return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
-  });
+  // Find the device: LONGEST mount-path match wins, and the match must end on a
+  // path boundary. A first-registered prefix match let the NullDevice
+  // ("\Device\Harddisk0") shadow every longer mount under it -- CACHE:
+  // ("\Device\Harddisk0\PartitionCache") never resolved, so WWE's PAC
+  // staging and Forza/Halo cache opens all 0xC000000F'd and titles crashed on
+  // their error paths (WWE: null-callback call). The boundary check also keeps
+  // "...\PartitionCache" from swallowing "...\PartitionCache0".
+  auto it = devices_.cend();
+  size_t best_len = 0;
+  for (auto d = devices_.cbegin(); d != devices_.cend(); ++d) {
+    const auto& mount = (*d)->mount_path();
+    if (!rex::string::utf8_starts_with_case(normalized_path, mount)) {
+      continue;
+    }
+    if (normalized_path.size() > mount.size() && normalized_path[mount.size()] != '\\') {
+      continue;  // not a path boundary (e.g. PartitionCache vs PartitionCache0)
+    }
+    if (mount.size() > best_len) {
+      best_len = mount.size();
+      it = d;
+    }
+  }
   if (it == devices_.cend()) {
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
