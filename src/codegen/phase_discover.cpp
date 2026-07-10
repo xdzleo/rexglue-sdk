@@ -159,8 +159,29 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
     graph.addJumpTableToFunction(funcAddr, jt);
   }
 
-  // Register external call targets as new functions (bl only, not b)
+  // Register external call targets as new functions (bl to unknown targets).
   for (uint32_t target : result.externalCalls) {
+    if (!graph.isEntryPoint(target) && !graph.isImport(target)) {
+      if (binary.isInImportExportRange(target)) {
+        continue;
+      }
+      graph.addFunction(target, 4, FunctionAuthority::DISCOVERED, true);
+    }
+  }
+
+  // Register cross-function `b` (tail-call) targets as functions too. Previously
+  // only `bl` targets were registered, so a compiler tail call (`b other_func`)
+  // whose destination was neither pdata-seeded nor bl-reached anywhere baked a
+  // REX_FATAL("Unresolved call ...") -- the single largest class of the static
+  // residue (~39%, empirically: 85/220 across 20 ports), and the exact bug that
+  // made a mis-classified `b` (Forza's 0x830ED910) fatal at runtime. A tail-call
+  // target IS a function entry; register it whether it starts fresh or overlaps
+  // another function's body (overlap is tolerated by tryResolveFunction). Never
+  // route a cross-function `b` to a forced_landing -- C++ cannot goto across
+  // function bodies. Byte-identical by construction: addFunction is a no-op when
+  // the target is already an entry (the dominant __rest/savegprlr interior case),
+  // so the only output delta is the functions that currently bake a REX_FATAL.
+  for (uint32_t target : result.tailCalls) {
     if (!graph.isEntryPoint(target) && !graph.isImport(target)) {
       if (binary.isInImportExportRange(target)) {
         continue;
