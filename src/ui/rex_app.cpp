@@ -12,9 +12,6 @@
 #include <rex/rex_app.h>
 
 #include <rex/chrono/clock.h>
-#include <cstdlib>
-
-#include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
@@ -22,8 +19,6 @@
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
-#include <rex/ui/overlay/achievement_toast.h>
-#include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/fps_overlay.h>
@@ -41,7 +36,6 @@
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/system.h>
-#include <rex/system/achievement_manager.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -273,24 +267,10 @@ std::string_view ReXApp::GetBuildTitle() const {
 
 std::string_view ReXApp::GetBuildStamp() const {
   return REXGLUE_BUILD_STAMP;
+}
 
 std::string ReXApp::GetWindowTitle() const {
   return std::string(GetName()) + " " + std::string(GetBuildTitle());
-std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
-  if (!runtime_ || !runtime_->kernel_state() || !imgui_drawer_ || !immediate_drawer_) {
-    return nullptr;
-  return std::make_unique<ui::AchievementsOverlayDialog>(
-      imgui_drawer_.get(), immediate_drawer_.get(), runtime_.get(), &achievements());
-
-std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
-  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
-  return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
-                                                      runtime_.get());
-
-system::AchievementManager& ReXApp::achievements() const {
-  assert_not_null(runtime_);
-  assert_not_null(runtime_->kernel_state());
-  return runtime_->kernel_state()->achievements();
 }
 
 bool ReXApp::OnInitialize() {
@@ -436,20 +416,11 @@ bool ReXApp::SetupEnvironment() {
   }
 
   PathConfig path_config{game_dir, user_dir, update_dir, cache_dir, config_path};
-  std::filesystem::path metadata_dir;
-  std::string metadata_root_cvar = REXCVAR_GET(metadata_root);
-  if (!metadata_root_cvar.empty()) {
-    metadata_dir = metadata_root_cvar;
-  }
-
-  PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
   update_data_root_ = path_config.update_data_root;
   cache_root_ = path_config.cache_root;
-  metadata_root_ = path_config.metadata_root;
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
 
@@ -492,9 +463,6 @@ bool ReXApp::SetupEnvironment() {
 #if REX_PLATFORM_LINUX
   LogLinuxRuntimeDiagnostics();
 #endif
-  if (!metadata_root_.empty()) {
-    REXLOG_INFO("  Metadata root:  {}", metadata_root_.string());
-  }
 
   return true;
 }
@@ -513,15 +481,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
 
-  game_data_root_ = paths.game_data_root;
-  user_data_root_ = paths.user_data_root;
-  update_data_root_ = paths.update_data_root;
-  cache_root_ = paths.cache_root;
-  metadata_root_ = paths.metadata_root;
-
-  runtime_ =
-      std::make_unique<rex::Runtime>(paths.game_data_root, paths.user_data_root,
-                                     paths.update_data_root, paths.cache_root, paths.metadata_root);
+  runtime_ = std::make_unique<rex::Runtime>(paths.game_data_root, paths.user_data_root,
+                                            paths.update_data_root, paths.cache_root);
   runtime_->set_app_context(&app_context());
   config_.config_path = paths.config_path;
 
@@ -564,7 +525,6 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
         if (!imgui_drawer_->HasDialogs()) {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
           return true;
         }
         const auto& io = imgui_drawer_->GetIO();
@@ -761,56 +721,8 @@ bool ReXApp::SetupPresentation() {
   return true;
 }
 
-void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDrawer* drawer) {
-  imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
-      window_.get(), 64, [this](ImFontAtlas* atlas) { OnConfigureFonts(atlas); });
-  // presenter is nullptr in detached mode; ImGuiDrawer tolerates that and the
-  // gated eager font upload in SetImmediateDrawer is skipped (font uploads
-  // lazily on the first Draw instead).
-  imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
-    if (debug_overlay_) {
-      debug_overlay_.reset();
-    } else {
-      debug_overlay_ =
-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
-    }
-  });
-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
-    if (console_overlay_) {
-      console_overlay_.reset();
-      console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
-    if (settings_overlay_) {
-      settings_overlay_.reset();
-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
-    if (achievements_overlay_) {
-      achievements_overlay_.reset();
-      achievements_overlay_ = CreateAchievementsOverlay();
-
-  OnCreateDialogs(imgui_drawer_.get());
-
 void ReXApp::LaunchModule() {
   app_context().CallInUIThreadDeferred([this]() {
-    // Register the achievement notification callback now that the runtime and
-    // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
-    // because KernelState is null during SetupPresentation.
-    if (!achievement_notification_) {
-      achievement_notification_ =
-          std::shared_ptr<ui::AchievementNotificationDialog>(CreateAchievementNotificationDialog());
-    }
-    if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
-        runtime_->kernel_state()) {
-      std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
-      achievement_notification_listener_ = achievements().RegisterNotificationCallback(
-          [notification](const rex::system::AchievementEvent& event) {
-            if (auto dialog = notification.lock()) {
-              dialog->Push(event);
-            }
-          });
-    }
-
     OnPreLaunchModule();
 
     auto main_thread = runtime_->PrepareModuleLaunch();
@@ -916,15 +828,6 @@ void ReXApp::OnDestroy() {
 
   // ImGui cleanup (reverse of setup)
   simple_settings_overlay_.reset();
-  rex::ui::UnregisterBind("bind_achievements");
-
-  if (achievement_notification_listener_ != 0) {
-    if (runtime_ && runtime_->kernel_state()) {
-      achievements().UnregisterCallback(achievement_notification_listener_);
-    }
-    achievement_notification_listener_ = 0;
-  achievement_notification_.reset();
-  achievements_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
