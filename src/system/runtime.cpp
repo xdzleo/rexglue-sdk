@@ -336,17 +336,40 @@ bool Runtime::SetupVfs() {
   file_system_->RegisterSymbolicLink("d:", mount_path);
   REXSYS_DEBUG("  Registered symbolic links: game:, d:");
 
-  // Mount update_data_root as update:\ if provided
-  if (!update_data_root_.empty()) {
-    auto abs_update_root = std::filesystem::absolute(update_data_root_);
-    if (std::filesystem::exists(abs_update_root)) {
-      auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
-      auto update_device =
-          std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
-      if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
-        file_system_->RegisterSymbolicLink("update:", update_mount);
-        REXSYS_INFO("  Mounted {} at update:", abs_update_root.string());
+  // Mount update:\ -- the Title Update partition. If update_data_root points
+  // at a staged TU, mount it; OTHERWISE mount an EMPTY dir so the device still
+  // EXISTS. The distinction matters: a title probing "update:\update.img" with
+  // no device mounted gets X_STATUS_NO_SUCH_DEVICE ("device not found"), an
+  // error some engines don't handle -- GTA V (RAGE) faults its init sequence
+  // on it and hangs the loading screen (a game thread blocks; the render
+  // thread idles re-submitting viz queries forever). With the device present
+  // the same probe returns X_STATUS_NO_SUCH_FILE ("file not found"), the
+  // clean "no update installed -> use base version" path. Read-only; empty dir
+  // created under cache_root. Harmless fleet-wide (an empty update: is what a
+  // console with no TU also presents).
+  {
+    std::filesystem::path update_host;
+    bool have_staged = false;
+    if (!update_data_root_.empty()) {
+      auto abs_update_root = std::filesystem::absolute(update_data_root_);
+      if (std::filesystem::exists(abs_update_root)) {
+        update_host = abs_update_root;
+        have_staged = true;
       }
+    }
+    if (!have_staged) {
+      update_host = !cache_root_.empty() ? (cache_root_ / "guest_update")
+                                         : (abs_game_root.parent_path() / "update");
+      std::error_code ec;
+      std::filesystem::create_directories(update_host, ec);  // read-only mount needs it to exist
+    }
+    auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
+    auto update_device =
+        std::make_unique<rex::filesystem::HostPathDevice>(update_mount, update_host, true);
+    if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
+      file_system_->RegisterSymbolicLink("update:", update_mount);
+      REXSYS_INFO("  Mounted {} at update: ({})", update_host.string(),
+                  have_staged ? "staged TU" : "empty -- no TU installed");
     }
   }
 
