@@ -436,15 +436,31 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
       break;
     }
     case XFileFsDeviceInformation: {
-      // Answer with a real device instead of FILE_DEVICE_UNKNOWN: every mounted
-      // volume in this runtime is backed by host storage, i.e. a fixed disk.
-      // GTA V's install-partition detection walks its volumes and rejects
-      // FILE_DEVICE_UNKNOWN, blocking its content install path.
+      // Answer with a real device instead of FILE_DEVICE_UNKNOWN (GTA V's
+      // install-partition detection walks its volumes and rejects UNKNOWN) --
+      // and with the CORRECT type per volume. The game-data mount stands in
+      // for the retail DVD, so it must answer CD_ROM: a disc-based title uses
+      // this to pick its media flow. GTA V classifies its volumes here (6
+      // calls at boot); answered DISK it took the "installed-to-HDD build"
+      // branch, expected the install payload as loose files at game:\, and
+      // fell through to the "insert installation disc" screen without ever
+      // enumerating its content packages. CD_ROM (verified against xenia,
+      // where game: is a DiscImageDevice on \Device\Cdrom0) sends it down the
+      // retail from-disc path: XamContentCreateEnumeratorInternal -> mount
+      // part0-3.rpf. Everything else (cache, content mounts) stays DISK.
       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
-      info->device_type = FILE_DEVICE_DISK;
-      info->characteristics = 0;
+      const auto& mount = file->device()->mount_path();
+      bool is_game_volume = mount == "\\Device\\Harddisk0\\Partition1";
+      if (is_game_volume) {
+        info->device_type = FILE_DEVICE_CD_ROM;
+        info->characteristics = X_FILE_REMOVABLE_MEDIA | X_FILE_READ_ONLY_DEVICE;
+      } else {
+        info->device_type = FILE_DEVICE_DISK;
+        info->characteristics = 0;
+      }
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
-      REXKRNL_DEBUG("XFileFsDeviceInformation -> FILE_DEVICE_DISK");
+      REXKRNL_DEBUG("XFileFsDeviceInformation ({}) -> {}", mount,
+                    is_game_volume ? "FILE_DEVICE_CD_ROM" : "FILE_DEVICE_DISK");
       break;
     }
     default: {
