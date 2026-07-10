@@ -503,7 +503,20 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-  return 0;
+  // Report a live LAN link (plugged into a 100Mbps full-duplex switch) but NOT
+  // internet/LIVE connectivity. Returning 0 (link down) traps RAGE-engine
+  // titles: GTA V's network/session-init state machine polls this every frame
+  // on the boot thread (~52 calls/s, dynamically measured) in a "wait until
+  // link is up" retry loop that never exits with 0 -> the loading screen
+  // livelocks (render stays alive submitting only viz queries, 0 draws).
+  // Flipping to link-active broke the loop (idle-spin ~58% -> active loading
+  // ~117% CPU, boot advanced). This claims only a LAN cable, not online: XnAddr
+  // still returns STATIC with no ONLINE bit and XnAddrToMachineId still reports
+  // not-signed-into-LIVE, so online/multiplayer paths are unchanged. Titles
+  // that ignore link status never read it; those that gate on it now proceed.
+  return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE |
+         XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
+         XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;  // 0x0B
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
