@@ -1647,14 +1647,17 @@ bool build_vupkd3d128(BuilderContext& ctx) {
       // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in 64 bits
       // x, y, z --> floats, w --> float
       ctx.println("\t{}.u64[0] = {}.u64[1];", ctx.v_temp(), vSrc);
-      // x (bits 0-19) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 44) >> 44);", ctx.temp(), ctx.v_temp());
+      // x/y/z (bits 0-19, 20-39, 40-59) - sign-extend each 20-bit field. Must be
+      // int64_t: the field sits at bits 44-63 after the shift, so a 32-bit cast
+      // keeps only the all-zero low half and the >>44 is UB (shift >= width) --
+      // it decoded x=y=z=0 unconditionally. No shipping title emits NORMPACKED64
+      // yet, so this is byte-identical fleet-wide and cures a latent silent
+      // miscompile (found by the >100% static-oracle audit).
+      ctx.println("\t{}.s32 = (int32_t)(int64_t({}.u64[0] << 44) >> 44);", ctx.temp(), ctx.v_temp());
       ctx.println("\t{}.f32[0] = float({}.s32);", vDst, ctx.temp());
-      // y (bits 20-39) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 24) >> 44);", ctx.temp(), ctx.v_temp());
+      ctx.println("\t{}.s32 = (int32_t)(int64_t({}.u64[0] << 24) >> 44);", ctx.temp(), ctx.v_temp());
       ctx.println("\t{}.f32[1] = float({}.s32);", vDst, ctx.temp());
-      // z (bits 40-59) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 4) >> 44);", ctx.temp(), ctx.v_temp());
+      ctx.println("\t{}.s32 = (int32_t)(int64_t({}.u64[0] << 4) >> 44);", ctx.temp(), ctx.v_temp());
       ctx.println("\t{}.f32[2] = float({}.s32);", vDst, ctx.temp());
       // w (bits 60-63) - 4 bits
       ctx.println("\t{}.f32[3] = float({}.u64[0] >> 60);", vDst, ctx.v_temp());
