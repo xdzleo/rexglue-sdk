@@ -10,6 +10,7 @@
  */
 
 #include <rex/cvar.h>
+#include <rex/filesystem/file.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -108,6 +109,95 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   }
 
   REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+
+  *handle_out = e->handle();
+  return X_ERROR_SUCCESS;
+}
+
+// The xuid/title-explicit enumerator variant (ordinal-imported by RAGE
+// titles: GTA V's install-partition discovery calls THIS, not the plain
+// XamContentCreateEnumerator -- with it stubbed the enumeration "succeeds
+// empty" and the game concludes the install content is absent, showing the
+// "insert installation disc" screen even with the packages staged). ABI and
+// semantics mirror xenia-canary's XamContentCreateEnumeratorInternal: caller
+// passes an explicit xuid (0 -> common only), an explicit title_id (0 ->
+// currently running title), and content_flags whose bit
+// 0x1000 (kExcludeCommon) suppresses the xuid=0 pass.
+u32 XamContentCreateEnumeratorInternal_entry(u64 xuid, u32 device_id, u32 content_type,
+                                             u32 title_id, u32 content_flags,
+                                             u32 items_per_enumerate,
+                                             mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
+  assert_not_null(handle_out);
+
+  auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
+  if ((device_id && device_info == nullptr) || !handle_out) {
+    if (buffer_size_ptr) {
+      *buffer_size_ptr = 0;
+    }
+    return X_E_INVALIDARG;
+  }
+
+  if (buffer_size_ptr) {
+    *buffer_size_ptr = sizeof(XCONTENT_DATA) * items_per_enumerate;
+  }
+
+  auto e = make_object<XStaticEnumerator<XCONTENT_DATA>>(REX_KERNEL_STATE(), items_per_enumerate);
+  auto result = e->Initialize(0xFF, 0xFE, 0x20005, 0x20007, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  constexpr uint32_t kExcludeCommon = 0x1000;
+
+  if (!device_info || device_info->device_id == DummyDeviceId::HDD) {
+    std::vector<uint64_t> xuids;
+    if (xuid) {
+      xuids.push_back(xuid);
+    }
+    if (!xuid || !(content_flags & kExcludeCommon)) {
+      xuids.push_back(0);  // common content (marketplace/install packages live here)
+    }
+    for (uint64_t enum_xuid : xuids) {
+      auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+          static_cast<uint32_t>(DummyDeviceId::HDD), enum_xuid,
+          XContentType(uint32_t(content_type)), title_id);
+      for (const auto& content_data : content_datas) {
+        auto item = e->AppendItem();
+        if (item) {
+          *item = content_data;
+          REXKRNL_INFO("XamContentCreateEnumeratorInternal: adding '{}' (file: {})",
+                       rex::string::to_utf8(content_data.display_name()),
+                       content_data.file_name());
+        }
+      }
+    }
+  }
+
+  if (!device_info || device_info->device_id == DummyDeviceId::ODD) {
+    // Disc-resident content (GAME:\Content\<xuid>\<title>\<type>\*): the
+    // install-disc layout. Not needed once packages are staged on the HDD
+    // side, but costs nothing and matches console behavior.
+    auto title = title_id ? title_id : REX_KERNEL_STATE()->title_id();
+    auto path = fmt::format("game:\\Content\\0000000000000000\\{:08X}\\{:08X}", title,
+                            uint32_t(content_type));
+    if (auto root_entry = REX_KERNEL_FS()->ResolvePath(path)) {
+      rex::filesystem::WildcardEngine find_engine;
+      find_engine.SetRule("*");
+      size_t find_index = 0;
+      while (auto* entry = root_entry->IterateChildren(find_engine, &find_index)) {
+        auto item = e->AppendItem();
+        if (item) {
+          item->device_id = static_cast<uint32_t>(DummyDeviceId::ODD);
+          item->content_type = XContentType(uint32_t(content_type));
+          item->set_display_name(string::to_utf16(entry->name()));
+          item->set_file_name(entry->name());
+        }
+      }
+    }
+  }
+
+  REXKRNL_DEBUG("XamContentCreateEnumeratorInternal: added {} items to enumerator",
+                e->item_count());
 
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
@@ -441,7 +531,8 @@ REX_EXPORT(__imp__XamContentDeleteInternal, rex::kernel::xam::XamContentDeleteIn
 REX_EXPORT_STUB(__imp__XamContentClosePackageFile);
 REX_EXPORT_STUB(__imp__XamContentCopyInternal);
 REX_EXPORT_STUB(__imp__XamContentCreateAndMountPackage);
-REX_EXPORT_STUB(__imp__XamContentCreateEnumeratorInternal);
+REX_EXPORT(__imp__XamContentCreateEnumeratorInternal,
+           rex::kernel::xam::XamContentCreateEnumeratorInternal_entry)
 REX_EXPORT_STUB(__imp__XamContentDismountAndClosePackage);
 REX_EXPORT_STUB(__imp__XamContentDuplicateFileHandle);
 REX_EXPORT_STUB(__imp__XamContentExistsOnDeviceInternal);
