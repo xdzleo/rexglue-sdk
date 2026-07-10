@@ -1097,10 +1097,18 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
   auto global_lock = global_critical_region_.Acquire();
   notify_listeners_.push_back(retain_object(listener));
 
-  // Games seem to expect a few notifications on startup, only for the first
-  // listener.
-  // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=resident+evil+5&start=375
-  if (!has_notified_startup_ && listener->mask() & 0x00000001) {
+  // Games expect the initial system-state notifications on startup. These are
+  // level-triggered "here is the current state" kicks (UI not shown, current
+  // signin, input devices) that real hardware delivers to EVERY listener
+  // subscribed to system notifications (mask bit 0), not just the first.
+  // The old `!has_notified_startup_` latch gave the batch to only the first
+  // system listener -- GTA V (RAGE) creates ~10-12 system listeners at boot
+  // and its network/UI init state machine waits on a LATER one, whose queue
+  // then stays empty forever: XNotifyGetNext polled 10,000+ times with 0
+  // dequeues, boot livelocked (dynamically measured). Delivering the batch
+  // per system listener clears that and matches hardware; a listener created
+  // mid-game receiving the current UI/signin state is a no-op re-check.
+  if (listener->mask() & 0x00000001) {
     has_notified_startup_ = true;
     // XN_SYS_UI (on, off)
     listener->EnqueueNotification(0x00000009, 1);
