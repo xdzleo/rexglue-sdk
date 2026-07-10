@@ -30,6 +30,27 @@ u32 XexCheckExecutablePrivilege_entry(u32 privilege) {
 
   // Privilege is bit position in xe_xex2_system_flags enum - so:
   // Privilege=6 -> 0x00000040 -> XEX_SYSTEM_INSECURE_SOCKETS
+
+  // Privilege 11 = XEX_SYSTEM_INSECURE_UTILITY_DRIVE. A title with this bit
+  // CLEAR (GTA V: system_flags=0x00018200) routes ALL cache-partition access
+  // through the SECURE broker -- an XAM background task (XMountUtilityDrive)
+  // that builds a \Device\cacheN volume and returns results via a two-event
+  // KeSetEvent/KeWaitForSingleObject handshake. Our IoCreateDevice /
+  // NtQueryVolumeInformationFile utility-drive support is a stub with guessed
+  // geometry, so that worker guest-faults on the first cache I/O and dies
+  // WITHOUT signaling its completion event -- every cache requester then blocks
+  // forever in an INFINITE KeWaitForSingleObject (threads go silent; the render
+  // thread idles re-submitting viz queries: GTA V's loading-screen hang, root-
+  // caused by IDA to wait sites 0x8363BFEC / 0x8363C760 on event 0x838786EC,
+  // signaled only by the faulted worker 0x8363C128). Reporting the drive as
+  // INSECURE makes the title take the DIRECT path, which uses our working
+  // writable cache:/cache0:/cache1: mounts and skips the broken broker -- what
+  // real hardware / Xenia effectively permit. Scoped to priv 11; every other
+  // privilege reads the real system-flags bit.
+  if (privilege == 11) {
+    return 1;
+  }
+
   uint32_t mask = 1 << privilege;
 
   auto module = REX_KERNEL_STATE()->GetExecutableModule();
