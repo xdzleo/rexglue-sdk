@@ -43,6 +43,8 @@ class UserModule : public XModule {
     kModuleFormatElf,
   };
 
+  ModuleFormat module_format() const { return module_format_; }
+
   const rex::runtime::XexModule* xex_module() const {
     assert_true(module_format_ == kModuleFormatXex);
     return reinterpret_cast<rex::runtime::XexModule*>(processor_module_);

@@ -582,6 +582,28 @@ object_ref<XModule> KernelState::GetModule(const std::string_view name, bool use
   return nullptr;
 }
 
+void KernelState::RebindSiblingImports() {
+  // Snapshot under the lock, bind outside it: XexModule::BindSiblingImports
+  // calls GetModule, which re-acquires the global lock.
+  std::vector<object_ref<UserModule>> mods;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    mods.assign(user_modules_.begin(), user_modules_.end());
+  }
+  auto exec = GetExecutableModule();
+  if (exec && exec->module_format() == UserModule::kModuleFormatXex) {
+    bool in_list = false;
+    for (auto& m : mods)
+      in_list |= (m.get() == exec.get());
+    if (!in_list)
+      exec->xex_module()->BindSiblingImports();
+  }
+  for (auto& m : mods) {
+    if (m->module_format() == UserModule::kModuleFormatXex)
+      m->xex_module()->BindSiblingImports();
+  }
+}
+
 object_ref<XThread> KernelState::PrepareModuleLaunch(object_ref<UserModule> module) {
   if (!module->is_executable()) {
     return nullptr;
@@ -835,6 +857,12 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     auto global_lock = global_critical_region_.Acquire();
     user_modules_.push_back(module);
   }
+
+  // Bind guest-to-guest imports BEFORE DllMain: the new module's attach code
+  // may call straight through a sibling-import thunk (Halo 3's L360.dll init
+  // calls WavesLibDLL exports), and older modules may import from the
+  // newcomer. Must run outside the global lock (GetModule re-acquires it).
+  RebindSiblingImports();
 
   if (module->is_dll_module() && module->entry_point() && call_entry) {
     if (!XThread::IsInThread()) {

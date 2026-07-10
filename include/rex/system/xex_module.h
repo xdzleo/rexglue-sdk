@@ -87,6 +87,16 @@ class XexModule : public Module {
 
   const std::vector<ImportLibrary>* import_libraries() const { return &import_libs_; }
 
+  // Bind imports from GUEST sibling modules (multi-XEX: L360.dll <-
+  // WavesLibDLL.dll): resolve each ordinal via the loaded sibling's export
+  // table and write the guest address into the paired type-0 IAT slot, which
+  // the recompiled thunk reads (lis/lwz r11, slot; mtctr; bctr -- see the
+  // codegen-side patch in project_recompiler.cpp). Kernel libraries never
+  // match a user module and are skipped. Idempotent -- rebinding writes the
+  // same values -- so KernelState re-runs it after every module load to make
+  // binding independent of load order. Returns the number of slots bound.
+  size_t BindSiblingImports();
+
   const xex2_opt_execution_info* opt_execution_info() const {
     xex2_opt_execution_info* retval = nullptr;
     GetOptHeader(XEX_HEADER_EXECUTION_INFO, &retval);

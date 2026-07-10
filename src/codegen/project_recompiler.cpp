@@ -253,6 +253,61 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     dllModules.push_back(std::move(userMod));
   }
 
+  // Sibling-module import thunks: a multi-XEX module's imports from a GUEST
+  // sibling (Halo 3's L360.dll <- WavesLibDLL.dll) are not kernel exports, so
+  // their thunks stay as raw XEX placeholder dwords -- the 360 loader would
+  // rewrite them at bind time, but recompiled code is compiled from the
+  // pre-bind image, so the "thunk" recompiled to a stale-r11 `mtctr; bctr`
+  // that looped back into its caller (L360 boot: caller<->thunk recursion ->
+  // guest stack overflow). Patch each such thunk IN THE LOADED IMAGE, before
+  // any BinaryView copies section data, into a real IAT-slot dispatch:
+  //     lis r11, slot@ha ; lwz r11, slot@l(r11) ; mtctr r11 ; bctr
+  // (exactly 16 bytes = the thunk size). The type-0 slot is bound at load
+  // time by XexModule::BindSiblingImports against the sibling's export table,
+  // so the recompiled thunk always dispatches to the CURRENT binding through
+  // the multi-module dispatcher. Kernel imports (resolved by the export
+  // resolver) are untouched; single-module titles have none of these ->
+  // codegen byte-identical.
+  {
+    auto* earlyResolver = runtime->export_resolver();
+    auto patchSiblingThunks = [&](rex::runtime::XexModule* xm, const std::string& display) {
+      size_t patched = 0;
+      for (const auto& lib : *xm->import_libraries()) {
+        for (const auto& fn : lib.imports) {
+          if (earlyResolver) {
+            auto* exp = earlyResolver->GetExportByOrdinal(lib.name + ".xex", fn.ordinal);
+            if (!exp)
+              exp = earlyResolver->GetExportByOrdinal(lib.name, fn.ordinal);
+            if (exp)
+              continue;  // kernel import -- leave for the __imp__ machinery
+          }
+          if (!fn.thunk_address || !fn.value_address)
+            continue;  // no pairable IAT slot -> leave the raw bytes (heals as before)
+          uint8_t* host = runtime->memory()->TranslateVirtual(fn.thunk_address);
+          if (!host)
+            continue;
+          uint32_t slot = fn.value_address;
+          uint32_t ha = (slot + 0x8000u) >> 16;
+          uint32_t lo = slot & 0xFFFFu;
+          rex::memory::store_and_swap<uint32_t>(host + 0, 0x3D600000u | ha);   // lis r11, slot@ha
+          rex::memory::store_and_swap<uint32_t>(host + 4, 0x816B0000u | lo);   // lwz r11, slot@l(r11)
+          rex::memory::store_and_swap<uint32_t>(host + 8, 0x7D6903A6u);        // mtctr r11
+          rex::memory::store_and_swap<uint32_t>(host + 12, 0x4E800420u);       // bctr
+          ++patched;
+        }
+      }
+      if (patched) {
+        REXCODEGEN_INFO("Patched {} sibling-module import thunk(s) in {} to IAT-slot dispatch",
+                        patched, display);
+      }
+    };
+    patchSiblingThunks(runtime->kernel_state()->GetExecutableModule()->xex_module(),
+                       targeted[0].targetName);
+    for (size_t i = 0; i < dllModules.size(); ++i) {
+      patchSiblingThunks(dllModules[i]->xex_module(), targeted[i + 1].targetName);
+    }
+  }
+
   struct ContextEntry {
     CodegenContext ctx;
     const ModuleEntry* module;

@@ -493,17 +493,25 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
         // multi-XEX title this is a SIBLING GUEST MODULE (Halo 3's L360.dll
         // imports from WavesLibDLL.dll), not a kernel export. Do NOT register
         // an extern IMPORT node (it would emit an undefined, unprefixed symbol
-        // and no definition -> link error). Instead skip registration entirely:
-        // the import THUNK code exists in the image and normal discovery
-        // recompiles it as plain guest code; at load time the XEX loader binds
-        // the IAT slot in guest memory, so the recompiled thunk's indirect
-        // branch resolves through the global multi-module dispatcher to the
-        // sibling's recompiled function. Titles whose imports all resolve
-        // (every single-module fleet title) never reach this branch ->
-        // codegen byte-identical.
+        // and no definition -> link error). The raw thunk bytes are XEX
+        // placeholder dwords (never real code -- the 360 loader rewrites them
+        // at bind time), so recompiling them "as plain guest code" produced a
+        // stale-r11 `mtctr r11; bctr` that looped back into its caller: Halo
+        // 3's L360 boot recursed caller<->thunk until guest stack overflow.
+        // The recompiler now pre-patches these thunks in the loaded image
+        // (project_recompiler.cpp) into a real IAT-slot dispatch (lis/lwz r11,
+        // slot; mtctr; bctr) whose slot the runtime binds against the sibling's
+        // export table (XexModule::BindSiblingImports). Here we only need to
+        // register the patched 16-byte thunk as a function: discovery refuses
+        // targets inside the import/export range (phase_discover's
+        // isInImportExportRange guard), so without this the thunk is only
+        // reachable via heal. Titles whose imports all resolve (every
+        // single-module fleet title) never reach this branch -> codegen
+        // byte-identical.
+        graph.addFunction(sym.address, 16, FunctionAuthority::DISCOVERED, true);
         REXCODEGEN_WARN(
-            "Unresolved import ordinal {} from {} -- treating its thunk as "
-            "plain guest code (sibling-module import)",
+            "Unresolved import ordinal {} from {} -- registered its IAT-slot "
+            "dispatch thunk as a guest function (sibling-module import)",
             ordinal, lib_name);
         unresolvedCount++;
         continue;

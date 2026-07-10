@@ -253,6 +253,10 @@ class KernelState {
   void SetExecutableModule(object_ref<UserModule> module);
   object_ref<UserModule> LoadUserModule(const std::string_view name, bool call_entry = true);
   void UnloadUserModule(const object_ref<UserModule>& module, bool call_entry = true);
+  // Re-bind guest-to-guest (sibling module) imports across every loaded XEX
+  // module. Idempotent; runs after each module load so binding is independent
+  // of load order (L360.dll <- WavesLibDLL.dll works whichever loads first).
+  void RebindSiblingImports();
 
   // Recompiled module registry (populated by generated RegisterRecompiledModules)
   struct RecompiledModuleInfo {

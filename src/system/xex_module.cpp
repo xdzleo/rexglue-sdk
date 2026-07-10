@@ -1194,6 +1194,50 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
   return true;
 }
 
+size_t XexModule::BindSiblingImports() {
+  size_t bound = 0;
+  for (const auto& lib : import_libs_) {
+    if (lib.imports.empty())
+      continue;
+    // A guest sibling is a loaded USER module; kernel libraries (xboxkrnl,
+    // xam, ...) never match one. lib.name is extensionless (base name), so
+    // try the bare name plus the two guest module extensions.
+    auto sibling = kernel_state_->GetModule(lib.name, /*user_only=*/true);
+    if (!sibling)
+      sibling = kernel_state_->GetModule(lib.name + ".dll", /*user_only=*/true);
+    if (!sibling)
+      sibling = kernel_state_->GetModule(lib.name + ".xex", /*user_only=*/true);
+    if (!sibling)
+      continue;  // not loaded (yet); the post-load rebind sweep covers it
+    size_t lib_bound = 0;
+    size_t lib_missing = 0;
+    for (const auto& import : lib.imports) {
+      if (!import.value_address)
+        continue;
+      // Raw guest address (caller_address=0 skips thunk allocation): the
+      // recompiled IAT-dispatch thunk bctr's to it and the multi-module
+      // dispatcher resolves it to the sibling's recompiled function.
+      uint32_t addr = sibling->GetProcAddressByOrdinal(
+          static_cast<uint16_t>(import.ordinal), /*caller_address=*/0);
+      if (!addr) {
+        lib_missing++;
+        continue;
+      }
+      auto* slot = memory()->TranslateVirtual<rex::be<uint32_t>*>(import.value_address);
+      if (!slot)
+        continue;
+      *slot = addr;
+      lib_bound++;
+    }
+    if (lib_bound) {
+      REXLOG_INFO("Bound {} sibling import(s) {} <- {}{}", lib_bound, name(), lib.name,
+                  lib_missing ? fmt::format(" ({} ordinal(s) unresolved)", lib_missing) : "");
+    }
+    bound += lib_bound;
+  }
+  return bound;
+}
+
 bool XexModule::ContainsAddress(uint32_t address) {
   return address >= low_address_ && address < high_address_;
 }
