@@ -11,6 +11,7 @@
 
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -322,10 +323,22 @@ u32 XamLoaderGetDvdTrayState_entry(mapped_u32 out_state) {
   return X_STATUS_SUCCESS;
 }
 
-u32 XamSwapDisc_entry(u32 disc_number) {
-  // Stub for multi-disc games. Single-disc games (like Blue Dragon's reblue test)
-  // don't need this, but the game may look it up dynamically via XexGetProcedureAddress.
-  REXKRNL_DEBUG("XamSwapDisc({}) - stub, returning success", (uint32_t)disc_number);
+u32 XamSwapDisc_entry(u32 disc_number, ppc_ptr_t<X_KEVENT> completion_handle,
+                      mapped_void error_message) {
+  // The real API is async: XAM prompts for the disc and SIGNALS the caller's
+  // completion KEVENT once the right disc is in the tray. The old one-arg
+  // stub returned success but swallowed the handle, so a title waiting on the
+  // event hung forever -- GTA V's play-disc flow calls
+  // XamSwapDisc(2, &event, msg) as the LAST step of its install state machine
+  // (after the content-package scan passes) and sat "loading" on that wait.
+  // In this runtime the virtual tray always holds the correct disc (the
+  // game-data root IS the mounted disc), so signal completion immediately --
+  // xenia's same-disc fast path (xeKeSetEvent on the completion handle).
+  REXKRNL_DEBUG("XamSwapDisc({}) -> disc already inserted; signaling completion",
+                (uint32_t)disc_number);
+  if (completion_handle) {
+    xboxkrnl::xeKeSetEvent(completion_handle, 1, 0);
+  }
   return X_STATUS_SUCCESS;
 }
 

@@ -42,12 +42,24 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
                                const XCONTENT_AGGREGATE_DATA& data,
                                const std::filesystem::path& package_path)
     : kernel_state_(kernel_state), root_name_(root_name), package_path_(package_path), license_(0) {
-  device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
+  // No trailing separator: guest paths arrive as "<root>:\file" and the VFS
+  // join does not normalize doubled separators -- "\Device\Content\2\" +
+  // "\part1.rpf" resolved to "\Device\Content\2\\part1.rpf", whose empty path
+  // component failed entry lookup. GTA V's install probe of its mounted
+  // content packages ("<pkg>:\partN.rpf") missed files that existed, so the
+  // partition scan never reached state 4 and the game fell back to the
+  // "insert installation disc" loop. Every other registered device
+  // (Partition1, Cdrom-style mounts) is separator-less already.
+  device_path_ = fmt::format("\\Device\\Content\\{0}", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
+  // OpenExisting packages must be read-only: creating the dir on a wrong path
+  // would mask a resolution bug as a silently-empty mount. A save (write) path
+  // creates its dir via ContentManager::CreateContent before this ctor runs.
+  bool exists = std::filesystem::exists(package_path);
   auto device =
-      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
+      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, exists);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
