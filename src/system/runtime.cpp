@@ -404,6 +404,30 @@ bool Runtime::SetupVfs() {
         REXSYS_WARN("  {} mount failed ({})", ci_link, ci_host.string());
       }
     }
+
+    // RAGE-engine scratch mounts (GTA V, Max Payne 3, Red Dead, Midnight Club):
+    // the title creates a writable "gamecache:" partition for its processed
+    // asset cache (gta5_cache_x.dat) and "commoncrc:" for CRC state, and mounts
+    // them by drive-style symlink -- NOT under \Device\Harddisk0, so the
+    // longest-match resolver never reaches them. Without a device every open
+    // returns [no device] and GTA V loops re-generating a cache it can never
+    // write, never finishing the loading screen. Same writable-HostPathDevice
+    // recipe; harmless for non-RAGE titles (they never touch these links).
+    for (const char* tag : {"gamecache", "commoncrc"}) {
+      std::filesystem::path rg_host = !cache_root_.empty()
+                                          ? (cache_root_ / (std::string("guest_") + tag))
+                                          : (abs_game_root.parent_path() / tag);
+      std::string rg_mount = std::string("\\Device\\") + tag;
+      std::string rg_link = std::string(tag) + ":";
+      auto rg_device = std::make_unique<rex::filesystem::HostPathDevice>(
+          rg_mount, rg_host, /*read_only=*/false);
+      if (rg_device->Initialize() && file_system_->RegisterDevice(std::move(rg_device))) {
+        file_system_->RegisterSymbolicLink(rg_link, rg_mount);
+        REXSYS_INFO("  Mounted writable {} at {}", rg_host.string(), rg_link);
+      } else {
+        REXSYS_WARN("  {} mount failed ({})", rg_link, rg_host.string());
+      }
+    }
   }
 
   return true;
