@@ -208,7 +208,16 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();
-  symlinks_.insert({std::string(path), std::string(target)});
+  // insert_or_assign, NOT insert: std::[unordered_]map::insert keeps the FIRST
+  // value for an existing key. A guest that re-registers the same root name to a
+  // new device (without closing the old one) must get the NEW target. GTA V's
+  // install-partition scan opens root "545408A70000000N" against several content
+  // packages in turn (file_name 00..N); the last open binds the package that
+  // actually holds partN.rpf, but insert() pinned the root to the FIRST mount
+  // (the dir holding part0.rpf), so "<root>:\partN.rpf" resolved to the wrong
+  // package and the world never streamed -> empty draw list, 0 frames. Last
+  // registration wins now, matching a real symlink rebind.
+  symlinks_.insert_or_assign(std::string(path), std::string(target));
   REXFS_DEBUG("Registered symbolic link: {} => {}", path, target);
 
   return true;
