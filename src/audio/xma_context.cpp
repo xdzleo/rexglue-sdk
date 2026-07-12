@@ -224,6 +224,17 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   // played out by the mixer fetch - wiping it audibly truncates live audio
   // (measured: mix clicks doubled with a memset here).
 
+  ResetDecoderState();
+}
+
+void XmaContext::ResetDecoderState() {
+  // A freed or re-initialized context is a new logical stream. Drop the previous
+  // wave's MDCT overlap-add tail (persistent av_context_) and any buffered
+  // subframes so frame 0 of the next same-format wave is not contaminated.
+  if (av_context_ && avcodec_is_open(av_context_)) {
+    avcodec_flush_buffers(av_context_);
+  }
+  raw_frame_.fill(0);
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
@@ -245,6 +256,7 @@ void XmaContext::Release() {
   assert_true(is_allocated());
 
   set_is_allocated(false);
+  ResetDecoderState();
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 }
