@@ -117,9 +117,11 @@ static std::optional<uint32_t> rage_bounded_wait(rex::system::XObject* object,
   uint32_t site = XThread::IsInThread()
                       ? static_cast<uint32_t>(current_ppc_context()->lr)
                       : 0u;
+  bool is_main = t && t->main_thread();
   REXKRNL_WARN("[rage-deadlock] infinite wait on obj={:#010x} (type {}) still pending after "
-               "{}ms on thread {:#x} site={:#010x}", obj_addr,
-               static_cast<int>(object->type()), cap_ms, t ? t->guest_object() : 0u, site);
+               "{}ms on thread {:#x}{} site={:#010x}", obj_addr,
+               static_cast<int>(object->type()), cap_ms, t ? t->guest_object() : 0u,
+               is_main ? " [MAIN]" : "", site);
   if (REXCVAR_GET(rage_wait_signal)) {
     // Global-freeze detector: count infinite-wait timeouts in a sliding window.
     // Only a mass burst (the whole pool piling up at once) trips it -- normal
@@ -143,22 +145,23 @@ static std::optional<uint32_t> rage_bounded_wait(rex::system::XObject* object,
                      "engaging auto-signal", g_count.load(), REXCVAR_GET(rage_wait_freeze_window_ms));
       }
     }
-    if (g_frozen.load(std::memory_order_relaxed)) {
-      // Auto-signal ONLY Events (type 2) -- the worker/render KICK events at the
-      // HEAD of the dependency chain (streaming sub_836C1C20 event obj+24460,
-      // render sub_836BED60 event device+60). The freeze capture showed the
-      // heads waiting on Events while the 42 downstream workers idle on
-      // Semaphores; those semaphore-workers are legitimately idle *because* the
-      // head stalled -- signaling them wakes workers that crash on an empty
-      // queue (verified: signaling a Semaphore killed the game). Nudge the head
-      // event to replay its lost KeSetEvent; the head then drains its queued job
-      // (the lost-wakeup only dropped the signal, the work is still queued) and
-      // legitimately releases the downstream semaphores. Then re-wait so the
-      // head acquires the event it just set (state stays consistent).
+    // Nudge ONLY the MAIN (entry-point) thread's wait -- it is the head of the
+    // whole game: it produces the render/job work the 42 idle workers consume.
+    // Event-only auto-signal proved SAFE but did NOT unblock, precisely because
+    // the main thread waits on a SEMAPHORE (via the generic wrapper sub_823C7D68,
+    // from the render-decision chain sub_822DE9D8->sub_82232F30) and was skipped.
+    // Blanket-signaling every worker crashes (idle workers wake to an empty
+    // queue). Signaling exactly the main's object -- whatever type -- wakes the
+    // producer; it then generates work and legitimately releases the downstream
+    // primitives. Low blast radius: one thread.
+    if (g_frozen.load(std::memory_order_relaxed) && is_main) {
       bool signaled = false;
       if (object->type() == XObject::Type::Event) {
         static_cast<XEvent*>(object)->Set(0, false);
         signaled = true;
+      } else if (object->type() == XObject::Type::Semaphore) {
+        int32_t prev = 0;
+        signaled = static_cast<XSemaphore*>(object)->ReleaseSemaphore(1, &prev);
       }
       if (signaled) {
         REXKRNL_WARN("[rage-deadlock] auto-signaled obj={:#010x} (type {}) to replay lost wakeup",
@@ -1427,26 +1430,15 @@ void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void
 }
 
 u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
-  assert_always("DPC does not dispatch yet; going to hang!");
-
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
-
-  // Lock dispatcher.
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
-  auto dpc_list = REX_KERNEL_STATE()->dpc_list();
-
-  // If already in a queue, abort.
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    return 0;
-  }
-
-  // Prep DPC.
-  dpc->arg1 = (uint32_t)arg1;
-  dpc->arg2 = (uint32_t)arg2;
-
-  dpc_list->Insert(list_entry_ptr);
-
-  return 1;
+  // Stash the DPC's system arguments, then queue it for real asynchronous
+  // dispatch on the deferred dispatch thread (KernelState::QueueDpc runs its
+  // routine via the function dispatcher). Previously this asserted and dropped
+  // the DPC into a list nothing drained -> any title whose worker/render kick
+  // is delivered by DPC hung (GTA V's Ludendorff vault-explosion freeze: the
+  // render KeSetEvent is posted by a DPC that never fired).
+  dpc->arg1 = static_cast<uint32_t>(arg1);
+  dpc->arg2 = static_cast<uint32_t>(arg2);
+  return REX_KERNEL_STATE()->QueueDpc(dpc.guest_address()) ? 1 : 0;
 }
 
 u32 KeRemoveQueueDpc_entry(ppc_ptr_t<XDPC> dpc) {

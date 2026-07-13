@@ -258,6 +258,15 @@ class KernelState {
   // of load order (L360.dll <- WavesLibDLL.dll works whichever loads first).
   void RebindSiblingImports();
 
+  // Queue a guest DPC (KDPC at dpc_ptr) for asynchronous dispatch: the deferred
+  // dispatch thread runs its routine(Dpc, Context, Arg1, Arg2) via the function
+  // dispatcher. Real 360 DPCs fire at DISPATCH_LEVEL soon after KeInsertQueueDpc;
+  // ours never ran (KeInsertQueueDpc inserted into a list nothing drained), so a
+  // title whose render/worker kick arrives by DPC deadlocked (GTA V vault
+  // freeze). Returns false if the DPC was already queued. KeRemoveQueueDpc can
+  // still cancel it before it runs.
+  bool QueueDpc(uint32_t dpc_ptr);
+
   // Recompiled module registry (populated by generated RegisterRecompiledModules)
   struct RecompiledModuleInfo {
     std::string pe_name;

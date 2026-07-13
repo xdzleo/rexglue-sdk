@@ -582,6 +582,43 @@ object_ref<XModule> KernelState::GetModule(const std::string_view name, bool use
   return nullptr;
 }
 
+bool KernelState::QueueDpc(uint32_t dpc_ptr) {
+  uint32_t list_entry_ptr = dpc_ptr + offsetof(XDPC, list_entry);
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (dpc_list_.IsQueued(list_entry_ptr)) {
+      return false;  // already queued
+    }
+    dpc_list_.Insert(list_entry_ptr);
+    dispatch_queue_.push_back([this, dpc_ptr, list_entry_ptr]() {
+      // Runs on the deferred dispatch thread (a bound guest thread_state).
+      {
+        auto lock = global_critical_region_.Acquire();
+        if (!dpc_list_.IsQueued(list_entry_ptr)) {
+          return;  // KeRemoveQueueDpc cancelled it before it ran
+        }
+        dpc_list_.Remove(list_entry_ptr);
+      }
+      auto* dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+      uint32_t routine = dpc->routine;
+      if (!routine) {
+        return;
+      }
+      uint64_t args[] = {dpc_ptr, static_cast<uint32_t>(dpc->context),
+                         static_cast<uint32_t>(dpc->arg1), static_cast<uint32_t>(dpc->arg2)};
+      auto thread = XThread::GetCurrentThread();
+      if (thread) {
+        REXSYS_DEBUG("[dpc] dispatching routine={:#010x} ctx={:#010x}", routine,
+                     static_cast<uint32_t>(dpc->context));
+        function_dispatcher_->ExecuteInterrupt(thread->thread_state(), routine, args,
+                                               rex::countof(args));
+      }
+    });
+  }
+  dispatch_cond_.notify_all();
+  return true;
+}
+
 void KernelState::RebindSiblingImports() {
   // Snapshot under the lock, bind outside it: XexModule::BindSiblingImports
   // calls GetModule, which re-acquires the global lock.
