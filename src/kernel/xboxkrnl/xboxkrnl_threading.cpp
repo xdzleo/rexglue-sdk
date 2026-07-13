@@ -63,25 +63,30 @@
 REXCVAR_DEFINE_INT32(rage_wait_log_ms, 0, "Compat",
                      "Log otherwise-infinite guest waits still pending after N ms "
                      "(RAGE deadlock diagnosis; behavior unchanged; 0=off)");
-// DANGEROUS opt-in on top of the log: after logging, force the wait to return
-// success (proceed as signaled) instead of resuming the infinite wait. Blanket
-// force breaks legitimate idle-worker waits at boot -- scope it to a single
-// stuck object's guest address, or use only once the log has named the culprit.
-REXCVAR_DEFINE_BOOL(rage_wait_force, false, "Compat",
-                    "After rage_wait_log_ms, force the wait to succeed (unblock; "
-                    "risky -- breaks legitimate infinite waits)");
-// The SURGICAL scope for rage_wait_force: the guest WAIT-SITE (the LR / return
-// address of the code that called the wait). This is stable across runs (a
-// fixed guest PC), unlike the object dispatch-header address (heap, per-run).
-// Blanket force -- forcing EVERY infinite wait -- breaks the game: legitimate
-// idle-worker waits are infinite by design and corrupt state when forced
-// (verified: boot dies, and post-boot force dies ~10s after engaging). So force
-// ONLY the one wait-loop the log named at the freeze: read its site=0x........
-// from a log-only run, set rage_wait_force_lr to it, enable rage_wait_force.
-// 0 = every site (the blanket, game-breaking behavior -- do not use).
-REXCVAR_DEFINE_INT32(rage_wait_force_lr, 0, "Compat",
-                     "rage_wait_force only fires for waits from this guest call site "
-                     "(LR); 0 = all (breaks the game)");
+// Opt-in unblock on top of the log: after rage_wait_log_ms, AUTO-SIGNAL the
+// stuck object (Event->Set, Semaphore->Release) instead of leaving it pending.
+// This is the LibertyRecomp mechanism, proven on the same RAGE engine: it
+// replays the wakeup a producer lost to the flag-race (the worker's queue still
+// holds the job -- only the KeSetEvent was skipped), so the worker wakes
+// LEGITIMATELY, drains its queue, and proceeds. A spuriously-woken idle worker
+// just re-checks its empty queue and sleeps again (safe) -- unlike a bare
+// force-return, which left the object state inconsistent and crashed the game.
+REXCVAR_DEFINE_BOOL(rage_wait_signal, false, "Compat",
+                    "After rage_wait_log_ms, auto-signal the stuck object to replay a "
+                    "lost RAGE wakeup (LibertyRecomp-style; risky, opt-in)");
+// rage_wait_signal only engages once a GLOBAL FREEZE is detected: at least this
+// many distinct infinite waits timed out inside one sliding window. Neither
+// time nor site nor object address distinguishes a legitimately-idle worker
+// (leave it) from the deadlocked one (nudge it) -- but the FREEZE does: when
+// the RAGE job system deadlocks, the whole thread pool piles into stuck waits
+// at once (43 threads in the captured vault freeze), whereas normal gameplay
+// only ever has a handful idle at a time and they recover. Nudging only after
+// the burst keeps normal play untouched.
+REXCVAR_DEFINE_INT32(rage_wait_freeze_threshold, 16, "Compat",
+                     "rage_wait_signal engages after this many infinite-wait timeouts "
+                     "in one window (global-freeze detector)");
+REXCVAR_DEFINE_INT32(rage_wait_freeze_window_ms, 15000, "Compat",
+                     "sliding window for the freeze-burst count");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -115,12 +120,53 @@ static std::optional<uint32_t> rage_bounded_wait(rex::system::XObject* object,
   REXKRNL_WARN("[rage-deadlock] infinite wait on obj={:#010x} (type {}) still pending after "
                "{}ms on thread {:#x} site={:#010x}", obj_addr,
                static_cast<int>(object->type()), cap_ms, t ? t->guest_object() : 0u, site);
-  if (REXCVAR_GET(rage_wait_force)) {
-    uint32_t only = static_cast<uint32_t>(REXCVAR_GET(rage_wait_force_lr));
-    if (only == 0 || only == site) {
-      REXKRNL_WARN("[rage-deadlock] forcing wait from site={:#010x} (obj={:#010x}) to succeed",
-                   site, obj_addr);
-      return X_STATUS_SUCCESS;
+  if (REXCVAR_GET(rage_wait_signal)) {
+    // Global-freeze detector: count infinite-wait timeouts in a sliding window.
+    // Only a mass burst (the whole pool piling up at once) trips it -- normal
+    // gameplay's sporadic idle waits never reach the threshold, so they are
+    // never nudged (that was what killed the time/blanket approaches).
+    static std::atomic<int64_t> g_window_start_ms{0};
+    static std::atomic<int32_t> g_count{0};
+    static std::atomic<bool> g_frozen{false};
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    if (!g_frozen.load(std::memory_order_relaxed)) {
+      int64_t ws = g_window_start_ms.load(std::memory_order_relaxed);
+      if (ws == 0 || now_ms - ws > REXCVAR_GET(rage_wait_freeze_window_ms)) {
+        g_window_start_ms.store(now_ms, std::memory_order_relaxed);
+        g_count.store(1, std::memory_order_relaxed);
+      } else if (g_count.fetch_add(1, std::memory_order_relaxed) + 1 >=
+                 REXCVAR_GET(rage_wait_freeze_threshold)) {
+        g_frozen.store(true, std::memory_order_relaxed);
+        REXKRNL_WARN("[rage-deadlock] GLOBAL FREEZE detected ({} stuck waits in {}ms) -- "
+                     "engaging auto-signal", g_count.load(), REXCVAR_GET(rage_wait_freeze_window_ms));
+      }
+    }
+    if (g_frozen.load(std::memory_order_relaxed)) {
+      // Auto-signal ONLY Events (type 2) -- the worker/render KICK events at the
+      // HEAD of the dependency chain (streaming sub_836C1C20 event obj+24460,
+      // render sub_836BED60 event device+60). The freeze capture showed the
+      // heads waiting on Events while the 42 downstream workers idle on
+      // Semaphores; those semaphore-workers are legitimately idle *because* the
+      // head stalled -- signaling them wakes workers that crash on an empty
+      // queue (verified: signaling a Semaphore killed the game). Nudge the head
+      // event to replay its lost KeSetEvent; the head then drains its queued job
+      // (the lost-wakeup only dropped the signal, the work is still queued) and
+      // legitimately releases the downstream semaphores. Then re-wait so the
+      // head acquires the event it just set (state stays consistent).
+      bool signaled = false;
+      if (object->type() == XObject::Type::Event) {
+        static_cast<XEvent*>(object)->Set(0, false);
+        signaled = true;
+      }
+      if (signaled) {
+        REXKRNL_WARN("[rage-deadlock] auto-signaled obj={:#010x} (type {}) to replay lost wakeup",
+                     obj_addr, static_cast<int>(object->type()));
+        uint64_t consume = static_cast<uint64_t>(-(int64_t(100) * 10000));  // 100ms
+        X_STATUS c = object->Wait(wait_reason, processor_mode, alertable, &consume);
+        return (c == X_STATUS_TIMEOUT) ? X_STATUS_SUCCESS : c;
+      }
     }
   }
   return std::nullopt;  // log-only: fall through to the real infinite wait (safe)
