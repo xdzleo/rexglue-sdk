@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -22,6 +23,13 @@
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_BOOL(mm_ignore_offset_for_ranged_allocations, false, "Compat",
+                    "Treat MmAllocatePhysicalMemoryEx min/max as heap-relative instead of true "
+                    "physical addresses (xenia-canary ignore_offset_for_ranged_allocations). "
+                    "Required by Yukes-engine titles (WWE SvR 2007/2008) whose bounds are "
+                    "already heap-relative; WRONG for titles passing real physical bounds "
+                    "(RAGE fixed-placement allocs land one page off and corrupt neighbours).");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -394,8 +402,15 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   // and the title dies during cache/asset bring-up ("failed to find contiguous range").
   // Only a *ranged* request is affected -- the common MmAllocatePhysicalMemory path passes
   // min=0/max=0xFFFFFFFF, so it stays byte-identical for every non-ranged allocation.
+  //
+  // Opt-in per title (canary keeps it behind a config flag too): the API contract says
+  // min/max are TRUE physical addresses, and engines that do their own physical layout
+  // (RAGE: GTA V fixed-placement allocs, min=base/max=base+size-1) end up one page off
+  // when the offset is ignored -- the title then writes through the addresses it ASKED
+  // for and clobbers whoever really owns that first page (seen as the XMA context array
+  // page getting 0xFF-filled -> permanent audio-ring spin/freeze).
   const bool ranged_alloc = (min_addr_range != 0) || (max_addr_range != 0xFFFFFFFFu);
-  if (ranged_alloc) {
+  if (ranged_alloc && REXCVAR_GET(mm_ignore_offset_for_ranged_allocations)) {
     heap_physical_address_offset = 0;
   }
   uint32_t heap_min_addr = rex::sat_sub(min_addr_range, heap_physical_address_offset);

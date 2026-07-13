@@ -222,8 +222,32 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   // The Xbox 360 kernel allocates the contexts with X_PAGE_NOCACHE |
   // X_PAGE_READWRITE and writes MmGetPhysicalAddress for the address to the
   // register.
-  context_data_first_ptr_ = memory()->SystemHeapAlloc(sizeof(XMA_CONTEXT_DATA) * kContextCount, 256,
-                                                      memory::kSystemHeapPhysical);
+  //
+  // Allocate from the 64 KB-page physical heap (0xA0000000, host offset 0),
+  // NOT the default 4 KB heap (0xE0000000): the E range carries the console's
+  // 4 KB physical offset, which Windows' 64 KB mapping granularity forces us
+  // to emulate only in host-side translation (TranslateVirtual) - statically
+  // recompiled guest code accesses membase+VA raw and lands ONE PAGE BELOW
+  // where the decoder reads/writes. Titles that poke contexts directly from
+  // guest code (XAudio-era engines; GTA V) then submit into a page the
+  // decoder never sees and poll a stale page forever (RAGE audio-ring freeze,
+  // "context page is 0xFF" symptom). In the offset-0 heap, guest raw access
+  // and host translation agree, for the game AND for this decoder.
+  {
+    auto* heap64k = memory()->LookupHeapByType(true, 64 * 1024);
+    uint32_t ctx_array_addr = 0;
+    if (heap64k &&
+        heap64k->AllocSystemHeap(
+            sizeof(XMA_CONTEXT_DATA) * kContextCount, 256,
+            memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+            memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false, &ctx_array_addr)) {
+      memory()->Zero(ctx_array_addr, sizeof(XMA_CONTEXT_DATA) * kContextCount);
+      context_data_first_ptr_ = ctx_array_addr;
+    } else {
+      context_data_first_ptr_ = memory()->SystemHeapAlloc(
+          sizeof(XMA_CONTEXT_DATA) * kContextCount, 256, memory::kSystemHeapPhysical);
+    }
+  }
   context_data_last_ptr_ = context_data_first_ptr_ + (sizeof(XMA_CONTEXT_DATA) * kContextCount - 1);
   register_file_[XmaRegister::ContextArrayAddress] =
       memory()->GetPhysicalAddress(context_data_first_ptr_);
@@ -244,8 +268,12 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
     // Trap writes through every host alias of the array: the virtual address
     // the kernel allocated plus the 0xA/0xC/0xE physical views - each is a
     // distinct host mapping of the same backing pages, and VirtualProtect on
-    // one does not cover the others.
+    // one does not cover the others. Aliases share the same offset WITHIN each
+    // view (the views carry the heap's physical offset identically), so the
+    // alias of VA v in view V is V | (v & 0x1FFFFFFF) - do NOT recompute via
+    // GetPhysicalAddress + view (off by the heap offset, guards the wrong page).
     const uint32_t phys = memory()->GetPhysicalAddress(context_data_first_ptr_);
+    const uint32_t view_offset = context_data_first_ptr_ & 0x1FFFFFFFu;
     const size_t bytes = sizeof(XMA_CONTEXT_DATA) * kContextCount;
     auto add_range = [&](uint32_t guest_va) {
       uint8_t* host = memory()->TranslateVirtual(guest_va);
@@ -266,9 +294,9 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
     };
     AddVectoredExceptionHandler(1, XmaGuardVeh);
     add_range(context_data_first_ptr_);
-    add_range(0xA0000000u + phys);
-    add_range(0xC0000000u + phys);
-    add_range(0xE0000000u + phys);
+    add_range(0xA0000000u | view_offset);
+    add_range(0xC0000000u | view_offset);
+    add_range(0xE0000000u | view_offset);
     REXAPU_WARN("XMA GUARD: armed on context array va={:08X} phys={:08X} ({} host ranges)",
                 context_data_first_ptr_, phys, xma_guard_range_count_);
   }
