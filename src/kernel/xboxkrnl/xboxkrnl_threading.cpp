@@ -39,14 +39,92 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 #include <rex/system/xtypes.h>
+#include <rex/cvar.h>
 #include <rex/ppc/context.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/fiber.h>
 #include <rex/thread/mutex.h>
 
+// RAGE worker-thread / streaming-job deadlock breaker (LibertyRecomp-style).
+// A RAGE title (GTA IV/V) can leave a resource/streaming worker blocked on a
+// completion primitive that a stalled async load never signals -- the main
+// thread then blocks behind it and only the GPU render thread survives,
+// spinning occlusion viz-queries on the last frame (frozen image, no crash;
+// GTA V's Ludendorff vault-explosion streaming burst is the trigger). Off by
+// default (0 = faithful infinite waits, fleet untouched). When set, an
+// otherwise-infinite guest wait is bounded to this many ms; on timeout the
+// stuck object is logged (a DumpBroken equivalent -- names the exact handle)
+// and the waiter proceeds as if signaled. A pragmatic unblock + diagnosis,
+// not a root-cause fix; enable per-title via <game>.toml.
+// N ms after which an otherwise-infinite guest wait is LOGGED (names the stuck
+// object -- a SyncTable_DumpBroken equivalent). Pure diagnosis: the thread then
+// resumes its real infinite wait, so behavior is unchanged and the fleet is
+// safe. 0 = off.
+REXCVAR_DEFINE_INT32(rage_wait_log_ms, 0, "Compat",
+                     "Log otherwise-infinite guest waits still pending after N ms "
+                     "(RAGE deadlock diagnosis; behavior unchanged; 0=off)");
+// DANGEROUS opt-in on top of the log: after logging, force the wait to return
+// success (proceed as signaled) instead of resuming the infinite wait. Blanket
+// force breaks legitimate idle-worker waits at boot -- scope it to a single
+// stuck object's guest address, or use only once the log has named the culprit.
+REXCVAR_DEFINE_BOOL(rage_wait_force, false, "Compat",
+                    "After rage_wait_log_ms, force the wait to succeed (unblock; "
+                    "risky -- breaks legitimate infinite waits)");
+// The SURGICAL scope for rage_wait_force: the guest WAIT-SITE (the LR / return
+// address of the code that called the wait). This is stable across runs (a
+// fixed guest PC), unlike the object dispatch-header address (heap, per-run).
+// Blanket force -- forcing EVERY infinite wait -- breaks the game: legitimate
+// idle-worker waits are infinite by design and corrupt state when forced
+// (verified: boot dies, and post-boot force dies ~10s after engaging). So force
+// ONLY the one wait-loop the log named at the freeze: read its site=0x........
+// from a log-only run, set rage_wait_force_lr to it, enable rage_wait_force.
+// 0 = every site (the blanket, game-breaking behavior -- do not use).
+REXCVAR_DEFINE_INT32(rage_wait_force_lr, 0, "Compat",
+                     "rage_wait_force only fires for waits from this guest call site "
+                     "(LR); 0 = all (breaks the game)");
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+
+// Bound-probe wrapper for an otherwise-infinite object wait. Returns nullopt
+// when disabled / the guest already bounded the wait / the probe succeeded
+// before the cap -> caller does nothing special. On cap-timeout it logs the
+// stuck object; then either resumes the real infinite wait (log-only, safe) or,
+// if force is enabled for this object, returns success (unblock).
+static std::optional<uint32_t> rage_bounded_wait(rex::system::XObject* object,
+                                                 uint32_t wait_reason, uint32_t processor_mode,
+                                                 uint32_t alertable, uint64_t* timeout_ptr) {
+  int32_t cap_ms = REXCVAR_GET(rage_wait_log_ms);
+  if (cap_ms <= 0 || timeout_ptr != nullptr) {
+    return std::nullopt;  // disabled, or the guest already bounded the wait
+  }
+  uint64_t rel = static_cast<uint64_t>(-(static_cast<int64_t>(cap_ms) * 10000));  // -100ns units
+  X_STATUS r = object->Wait(wait_reason, processor_mode, alertable, &rel);
+  if (r != X_STATUS_TIMEOUT) {
+    if (alertable && r == X_STATUS_USER_APC && XThread::IsInThread()) {
+      XThread::GetCurrentThread()->DeliverAPCs();
+    }
+    return r;  // resolved within the cap -- normal
+  }
+  auto* t = XThread::GetCurrentThread();
+  uint32_t obj_addr = object->guest_object();
+  uint32_t site = XThread::IsInThread()
+                      ? static_cast<uint32_t>(current_ppc_context()->lr)
+                      : 0u;
+  REXKRNL_WARN("[rage-deadlock] infinite wait on obj={:#010x} (type {}) still pending after "
+               "{}ms on thread {:#x} site={:#010x}", obj_addr,
+               static_cast<int>(object->type()), cap_ms, t ? t->guest_object() : 0u, site);
+  if (REXCVAR_GET(rage_wait_force)) {
+    uint32_t only = static_cast<uint32_t>(REXCVAR_GET(rage_wait_force_lr));
+    if (only == 0 || only == site) {
+      REXKRNL_WARN("[rage-deadlock] forcing wait from site={:#010x} (obj={:#010x}) to succeed",
+                   site, obj_addr);
+      return X_STATUS_SUCCESS;
+    }
+  }
+  return std::nullopt;  // log-only: fall through to the real infinite wait (safe)
+}
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -945,6 +1023,11 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
+  if (auto r = rage_bounded_wait(object.get(), wait_reason, processor_mode, alertable,
+                                 timeout_ptr)) {
+    return *r;
+  }
+
   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
 
   if (alertable && result == X_STATUS_USER_APC) {
@@ -975,7 +1058,11 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-    result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    uint64_t* tp = timeout_ptr ? &timeout : nullptr;
+    if (auto r = rage_bounded_wait(object.get(), 3, wait_mode, alertable, tp)) {
+      return *r;
+    }
+    result = object->Wait(3, wait_mode, alertable, tp);
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }
