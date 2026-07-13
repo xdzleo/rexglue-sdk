@@ -25,11 +25,27 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
+#include <algorithm>
+#include <atomic>
+
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
+
 extern "C" {
 #include "libavutil/log.h"
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+REXCVAR_DEFINE_BOOL(xma_guard_context_array, false, "Audio",
+                    "Diagnostic: write-trap the XMA context array pages and log every writer RIP "
+                    "(finds stray writes that corrupt hardware contexts)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -56,6 +72,104 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 // using the XMA* functions.
 
 namespace rex::audio {
+
+#if REX_PLATFORM_WIN32
+// --- xma_guard_context_array: page-protection tripwire -----------------------
+// The XMA context array lives in kernel physical memory; a stray write there
+// (wrong-extent GPU resolve, allocator collision, stale pointer) destroys the
+// hardware contexts and stalls every audio stream that lands in the clobbered
+// page. Guarding the pages READONLY and re-arming via single-step records the
+// RIP of every writer, legitimate or not, so the stray one can be named.
+namespace {
+
+struct XmaGuardRange {
+  uintptr_t lo;
+  uintptr_t hi;
+};
+XmaGuardRange xma_guard_ranges_[8];
+size_t xma_guard_range_count_ = 0;
+struct XmaGuardWriter {
+  uintptr_t rip;
+  uint32_t count;
+};
+XmaGuardWriter xma_guard_writers_[64];
+std::atomic<uint32_t> xma_guard_writer_count_{0};
+std::atomic<uint64_t> xma_guard_hit_count_{0};
+thread_local uintptr_t xma_guard_rearm_page_ = 0;
+
+LONG CALLBACK XmaGuardVeh(_EXCEPTION_POINTERS* ep) {
+  auto* rec = ep->ExceptionRecord;
+  if (rec->ExceptionCode == STATUS_SINGLE_STEP) {
+    if (!xma_guard_rearm_page_) {
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
+    DWORD old_protect;
+    VirtualProtect(reinterpret_cast<void*>(xma_guard_rearm_page_), 0x1000, PAGE_READONLY,
+                   &old_protect);
+    xma_guard_rearm_page_ = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters < 2 ||
+      rec->ExceptionInformation[0] != 1) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const uintptr_t addr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+  for (size_t i = 0; i < xma_guard_range_count_; ++i) {
+    if (addr < xma_guard_ranges_[i].lo || addr >= xma_guard_ranges_[i].hi) {
+      continue;
+    }
+    const uintptr_t rip = reinterpret_cast<uintptr_t>(rec->ExceptionAddress);
+    const uint32_t n = std::min<uint32_t>(xma_guard_writer_count_.load(std::memory_order_acquire),
+                                          uint32_t(rex::countof(xma_guard_writers_)));
+    bool known = false;
+    for (uint32_t j = 0; j < n; ++j) {
+      if (xma_guard_writers_[j].rip == rip) {
+        ++xma_guard_writers_[j].count;
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      const uint32_t slot = xma_guard_writer_count_.fetch_add(1, std::memory_order_acq_rel);
+      if (slot < rex::countof(xma_guard_writers_)) {
+        xma_guard_writers_[slot] = {rip, 1};
+      }
+    }
+    xma_guard_hit_count_.fetch_add(1, std::memory_order_relaxed);
+    // Allow the write, then re-protect from the single-step trap.
+    const uintptr_t page = addr & ~uintptr_t(0xFFF);
+    DWORD old_protect;
+    VirtualProtect(reinterpret_cast<void*>(page), 0x1000, PAGE_READWRITE, &old_protect);
+    xma_guard_rearm_page_ = page;
+    ep->ContextRecord->EFlags |= 0x100;  // trap flag: re-arm after this instruction
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void XmaGuardDumpWriters() {
+  const uint32_t n = std::min<uint32_t>(xma_guard_writer_count_.load(std::memory_order_acquire),
+                                        uint32_t(rex::countof(xma_guard_writers_)));
+  REXAPU_WARN("XMA GUARD: {} hits, {} distinct writer RIPs:",
+              xma_guard_hit_count_.load(std::memory_order_relaxed), n);
+  for (uint32_t j = 0; j < n; ++j) {
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(xma_guard_writers_[j].rip), &mod) &&
+        mod) {
+      GetModuleFileNameA(mod, name, sizeof(name));
+    }
+    REXAPU_WARN("XMA GUARD:   rip={:#x} ({}+{:#x}) count={}", xma_guard_writers_[j].rip,
+                strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name,
+                mod ? xma_guard_writers_[j].rip - reinterpret_cast<uintptr_t>(mod) : 0,
+                xma_guard_writers_[j].count);
+  }
+}
+
+}  // namespace
+#endif  // REX_PLATFORM_WIN32
 
 XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()), function_dispatcher_(function_dispatcher) {}
@@ -125,6 +239,41 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
 
+#if REX_PLATFORM_WIN32
+  if (REXCVAR_GET(xma_guard_context_array)) {
+    // Trap writes through every host alias of the array: the virtual address
+    // the kernel allocated plus the 0xA/0xC/0xE physical views - each is a
+    // distinct host mapping of the same backing pages, and VirtualProtect on
+    // one does not cover the others.
+    const uint32_t phys = memory()->GetPhysicalAddress(context_data_first_ptr_);
+    const size_t bytes = sizeof(XMA_CONTEXT_DATA) * kContextCount;
+    auto add_range = [&](uint32_t guest_va) {
+      uint8_t* host = memory()->TranslateVirtual(guest_va);
+      if (!host || xma_guard_range_count_ >= rex::countof(xma_guard_ranges_)) {
+        return;
+      }
+      const uintptr_t lo = reinterpret_cast<uintptr_t>(host) & ~uintptr_t(0xFFF);
+      const uintptr_t hi =
+          (reinterpret_cast<uintptr_t>(host) + bytes + 0xFFF) & ~uintptr_t(0xFFF);
+      for (size_t i = 0; i < xma_guard_range_count_; ++i) {
+        if (xma_guard_ranges_[i].lo == lo) {
+          return;  // alias resolved to an already-guarded host mapping
+        }
+      }
+      xma_guard_ranges_[xma_guard_range_count_++] = {lo, hi};
+      DWORD old_protect;
+      VirtualProtect(reinterpret_cast<void*>(lo), hi - lo, PAGE_READONLY, &old_protect);
+    };
+    AddVectoredExceptionHandler(1, XmaGuardVeh);
+    add_range(context_data_first_ptr_);
+    add_range(0xA0000000u + phys);
+    add_range(0xC0000000u + phys);
+    add_range(0xE0000000u + phys);
+    REXAPU_WARN("XMA GUARD: armed on context array va={:08X} phys={:08X} ({} host ranges)",
+                context_data_first_ptr_, phys, xma_guard_range_count_);
+  }
+#endif
+
   worker_running_ = true;
   work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(work_event_);
@@ -147,7 +296,39 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+#if REX_PLATFORM_WIN32
+  const bool guard_on = REXCVAR_GET(xma_guard_context_array) && xma_guard_range_count_ > 0;
+  uint64_t guard_last_hits = 0;
+  uint32_t guard_pass = 0;
+  bool guard_ff_reported = false;
+#endif
   while (worker_running_) {
+#if REX_PLATFORM_WIN32
+    // Tripwire bookkeeping: report new writers periodically, and dump the
+    // writer table the moment a context page turns to 0xFF (the corruption
+    // signature this guard exists to catch).
+    if (guard_on && (++guard_pass & 0x1FF) == 0) {
+      const uint64_t hits = xma_guard_hit_count_.load(std::memory_order_relaxed);
+      if (hits != guard_last_hits) {
+        guard_last_hits = hits;
+        XmaGuardDumpWriters();
+      }
+    }
+    if (guard_on && !guard_ff_reported && (guard_pass & 0x3F) == 0) {
+      const auto* p = memory()->TranslateVirtual(context_data_first_ptr_);
+      if (p) {
+        bool all_ff = true;
+        for (size_t i = 0; i < 64 && all_ff; ++i) {
+          all_ff = p[i] == 0xFF;
+        }
+        if (all_ff) {
+          guard_ff_reported = true;
+          REXAPU_ERROR("XMA GUARD: context page is now 0xFF-filled! writers so far:");
+          XmaGuardDumpWriters();
+        }
+      }
+    }
+#endif
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
