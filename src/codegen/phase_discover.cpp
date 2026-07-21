@@ -142,8 +142,8 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   // fleet-wide by construction (no heuristic guessing).
   const std::unordered_set<uint32_t>* forced =
       ctx.Config().forcedLandings.empty() ? nullptr : &ctx.Config().forcedLandings;
-  auto result =
-      discoverBlocks(decoded, funcAddr, *region, effectiveKnownFunctions, pdataSize, forced);
+  auto result = discoverBlocks(decoded, funcAddr, *region, effectiveKnownFunctions, pdataSize,
+                               forced, &ctx.Config().switchTables);
 
   if (result.blocks.empty()) {
     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);

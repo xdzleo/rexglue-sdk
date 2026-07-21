@@ -262,12 +262,11 @@ struct BlockDiscoveryResult {
  *        heuristic filtering is needed here. nullptr/empty => no seeding (byte-identical).
  * @return BlockDiscoveryResult containing blocks, branches, and jump tables
  */
-BlockDiscoveryResult discoverBlocks(DecodedBinary& decoded, uint32_t entryPoint,
-                                    const CodeRegion& containingRegion,
-                                    const std::unordered_set<uint32_t>& knownFunctions,
-                                    uint32_t pdataSize = 0,
-                                    const std::unordered_set<uint32_t>*
-                                        forcedLandings = nullptr);
+BlockDiscoveryResult discoverBlocks(
+    DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+    const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize = 0,
+    const std::unordered_set<uint32_t>* forcedLandings = nullptr,
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr);
 
 //=============================================================================
 // Jump Table Detection
