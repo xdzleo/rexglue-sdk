@@ -956,18 +956,14 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
-<<<<<<< HEAD
   rex::ui::UnregisterBind("bind_game_settings");
 
-  // ImGui cleanup (reverse of setup)
-  simple_settings_overlay_.reset();
-=======
   // The show_fps_counter callback captures `this` - drop it before teardown.
   rex::cvar::UnregisterChangeCallbacks("show_fps_counter");
 
   // ImGui cleanup (reverse of setup)
+  simple_settings_overlay_.reset();
   fps_overlay_.reset();
->>>>>>> 7eb0faf
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
