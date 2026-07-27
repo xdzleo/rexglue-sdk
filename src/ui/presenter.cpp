@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <utility>
 
 #include <rex/assert.h>
@@ -43,6 +44,13 @@ REXCVAR_DEFINE_INT32(presenter_strict_guest_output_backpressure_timeout_ms, 100,
                      "Maximum time strict guest output backpressure may wait before allowing a "
                      "mailbox frame replacement")
     .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(presenter_present_cadence_log, false, "UI/Presenter",
+                    "Log guest present cadence statistics every 600 swaps: average/max "
+                    "swap-to-swap interval, standard deviation, and frame-to-frame jitter "
+                    "(mean absolute successive difference). Attributes perceived judder to "
+                    "irregular present timing versus low frame rate.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
@@ -585,6 +593,40 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    // Present-cadence telemetry: the interval between guest output refreshes
+    // is the cadence the host presents at (painting is triggered per
+    // refresh), which VRR displays turn directly into perceived smoothness.
+    // jitter = mean absolute successive frame-to-frame difference, the
+    // judder-relevant metric; sd and max catch slow drift and hitches.
+    if (REXCVAR_GET(presenter_present_cadence_log)) {
+      static std::chrono::steady_clock::time_point s_cad_prev{};
+      static double s_cad_sum = 0, s_cad_sumsq = 0, s_cad_max = 0;
+      static double s_cad_jitter_sum = 0, s_cad_last = 0;
+      static uint32_t s_cad_n = 0;
+      const auto cad_now = std::chrono::steady_clock::now();
+      if (s_cad_prev.time_since_epoch().count() != 0) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(cad_now - s_cad_prev).count();
+        s_cad_sum += ms;
+        s_cad_sumsq += ms * ms;
+        s_cad_max = std::max(s_cad_max, ms);
+        if (s_cad_n != 0) {
+          s_cad_jitter_sum += std::abs(ms - s_cad_last);
+        }
+        s_cad_last = ms;
+        if (++s_cad_n >= 600) {
+          const double avg = s_cad_sum / s_cad_n;
+          const double var = std::max(0.0, s_cad_sumsq / s_cad_n - avg * avg);
+          REXLOG_INFO(
+              "present-cadence: avg={:.2f}ms sd={:.2f} jitter={:.3f} max={:.2f} "
+              "(600 swaps)",
+              avg, std::sqrt(var), s_cad_jitter_sum / (s_cad_n - 1), s_cad_max);
+          s_cad_sum = s_cad_sumsq = s_cad_max = s_cad_jitter_sum = s_cad_last = 0;
+          s_cad_n = 0;
+        }
+      }
+      s_cad_prev = cad_now;
+    }
     if (GuestFrameStatsEnabled()) {
       std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
       guest_frame_timestamps_[guest_frame_timestamp_next_] = std::chrono::steady_clock::now();
@@ -766,19 +808,31 @@ Presenter::GuestFrameStats Presenter::GetGuestFrameStats() const {
   }
   const double span_to_now_seconds =
       std::chrono::duration_cast<std::chrono::duration<double>>(now - oldest_in_window).count();
-  if (span_to_now_seconds > 0.0) {
-    stats.fps = double(frames_in_window) / span_to_now_seconds;
-  }
+  double span_between_frames_seconds = 0.0;
   if (frames_in_window >= 2) {
-    const double span_between_frames_seconds =
+    span_between_frames_seconds =
         std::chrono::duration_cast<std::chrono::duration<double>>(newest_in_window -
                                                                   oldest_in_window)
             .count();
-    if (span_between_frames_seconds > 0.0) {
-      stats.frame_time_ms =
-          span_between_frames_seconds * 1000.0 / double(frames_in_window - 1);
-    }
-  } else if (stats.fps > 0.0) {
+  }
+  if (span_between_frames_seconds > 0.0 && span_to_now_seconds > 0.0) {
+    const double mean_interval_seconds =
+        span_between_frames_seconds / double(frames_in_window - 1);
+    stats.frame_time_ms = mean_interval_seconds * 1000.0;
+    // Rate = frame intervals per second, not frames per second: N frames span
+    // only N - 1 intervals, so dividing the frame count by the span reads up
+    // to one FPS high (oscillating with sampling phase, e.g. 140-141 at a
+    // steady 140). The partial interval elapsed since the newest frame is
+    // included so a steady source reads exactly its rate regardless of
+    // phase, but clamped to one interval so the estimate still decays toward
+    // zero when the guest stops producing frames.
+    const double partial_interval = std::min(
+        (span_to_now_seconds - span_between_frames_seconds) / mean_interval_seconds, 1.0);
+    stats.fps = (double(frames_in_window - 1) + partial_interval) / span_to_now_seconds;
+  } else if (span_to_now_seconds > 0.0) {
+    // A single frame in the window (or coincident timestamps): no interval to
+    // measure, keep the frame-count estimate.
+    stats.fps = double(frames_in_window) / span_to_now_seconds;
     stats.frame_time_ms = 1000.0 / stats.fps;
   }
   return stats;
@@ -1396,6 +1450,16 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       letterbox_clear_rectangle_top.height = host_rt_height - letterbox_mid_bottom;
     }
   }
+
+  // Cache the final letterboxed rectangle for UI-thread consumers
+  // (GetLastGuestOutputPaintRect). Values fit 16 bits comfortably (8K wide is
+  // 7680); reached only on the successful path, so degenerate flows keep the
+  // previous rectangle.
+  last_guest_output_paint_rect_.store(
+      uint64_t(uint16_t(int16_t(flow.output_x))) |
+          (uint64_t(uint16_t(int16_t(flow.output_y))) << 16) |
+          (uint64_t(uint16_t(output_width)) << 32) | (uint64_t(uint16_t(output_height)) << 48),
+      std::memory_order_relaxed);
 
   return flow;
 }

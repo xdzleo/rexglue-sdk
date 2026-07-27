@@ -28,10 +28,11 @@ endif()
 
 # Graphics backend selection
 # D3D12: Windows only, ON by default.
-# Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
+# Vulkan: Cross-platform, ON by default everywhere. Windows builds both
+# backends by default; the active one is chosen at runtime (gpu_backend cvar).
 if(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
-    option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
+    option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 else()
     set(REXGLUE_USE_D3D12 OFF)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
@@ -84,7 +85,7 @@ endif()
 
 # Enforce x64 architecture
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "ReXGlue only supports 64‑bit architectures (x86_64 or ARM64)")
+    message(FATAL_ERROR "ReXGlue only supports 64-bit architectures (x86_64 or ARM64)")
 endif()
 
 # Set C++23 standard

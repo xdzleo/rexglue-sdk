@@ -1,6 +1,6 @@
 /**
  * @file        ui/rex_app.cpp
- * @brief       ReXApp implementation — compiled as part of the consumer executable
+ * @brief       ReXApp implementation, compiled as part of the consumer executable
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  *              All rights reserved.
@@ -25,6 +25,7 @@
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/ui/overlay/simple_settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/native_rhi.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
@@ -52,6 +53,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include <fmt/format.h>
@@ -60,13 +63,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace rex {
 
@@ -233,19 +239,54 @@ void LogLinuxRuntimeDiagnostics() {
   LogEnvIfSet("VK_DRIVER_FILES");
 }
 
+#endif
+
+// Once a close is requested the process must terminate even if a teardown
+// step deadlocks (a wedged GPU worker or guest thread otherwise leaves a
+// not-responding process the user has to kill): give the orderly shutdown a
+// grace window, then force the exit.
 void StartForcedExitWatchdog(const char* reason) {
   std::thread([reason]() {
     std::this_thread::sleep_for(std::chrono::seconds(10));
-    REXLOG_WARN("{} watchdog exiting process after shutdown timeout", reason);
+    // The teardown this guards can wedge with the process heap lock orphaned
+    // (a guest thread suspended or terminated mid-allocation), so the kill
+    // path must not allocate or run lock-taking shutdown: logging and
+    // std::_Exit are both off-limits on Windows (ExitProcess acquires the
+    // heap lock inside RtlExitUserProcess, deadlocking the watchdog itself).
+    // TerminateProcess skips user-mode cleanup entirely; on POSIX std::_Exit
+    // is a plain exit_group with no lock use. The marker is emitted through
+    // heap-free primitives only.
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "%s watchdog terminating process after shutdown timeout\n",
+                  reason);
+#if REX_PLATFORM_WIN32
+    OutputDebugStringA(msg);
+    HANDLE log_handle = GetStdHandle(STD_ERROR_HANDLE);
+    if (log_handle != INVALID_HANDLE_VALUE && log_handle != nullptr) {
+      DWORD written = 0;
+      WriteFile(log_handle, msg, DWORD(std::strlen(msg)), &written, nullptr);
+    }
+    TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
+#else
+    ssize_t written = write(STDERR_FILENO, msg, std::strlen(msg));
+    (void)written;
     std::_Exit(EXIT_SUCCESS);
+#endif
   }).detach();
 }
-#endif
 
 }  // namespace
 
-REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
-                    "Enable the developer cvar browser on F4");
+REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, false, "UI/Advanced",
+                    "Enable the developer cvar browser on F4")
+    .debug_only();
+
+REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
+                      "Graphics API used for rendering (auto, d3d12, vulkan). Auto prefers "
+                      "Direct3D 12 when available. Applied at startup; when the selected API "
+                      "fails to initialize, any other compiled-in backend is tried.")
+    .allowed({"auto", "d3d12", "vulkan"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(simple_settings_overlay_enabled, true, "UI",
                     "Enable the in-game settings menu (resolution, framerate, etc.) on F1");
@@ -308,7 +349,9 @@ bool ReXApp::OnInitialize() {
 }
 
 bool ReXApp::SetupEnvironment() {
-  auto exe_dir = rex::filesystem::GetExecutableFolder();
+  // App root, not executable folder: inside a macOS .app bundle the config
+  // and logs stay next to the bundle, where users can find them.
+  auto exe_dir = rex::filesystem::GetAppRootFolder();
   auto config_path = exe_dir / (std::string(GetName()) + ".toml");
 
   // Load config before resolving cvar-backed paths such as game_data_root.
@@ -424,6 +467,16 @@ bool ReXApp::SetupEnvironment() {
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
 
+  // Native-render RHI shader bytecode cache: the D3D12 backend runtime-
+  // compiles its HLSL, and the largest scene shader costs seconds on the
+  // render thread at first-frame pipeline creation; cached bytecode turns
+  // every launch after the first into a file read. Must be set before the
+  // graphics system creates its first shader.
+  if (!cache_root_.empty()) {
+    graphics::nrhi::SetShaderBytecodeCacheDirectory(
+        (cache_root_ / "nrhi_shaders").string().c_str());
+  }
+
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
   std::string log_level_str = REXCVAR_GET(log_level);
@@ -449,7 +502,12 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path_))
     REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
 
-  REXLOG_INFO("{} starting", GetName());
+  // Include the build title so support logs identify the exact build.
+  if (auto build_title = GetBuildTitle(); !build_title.empty()) {
+    REXLOG_INFO("{} starting {}", GetName(), build_title);
+  } else {
+    REXLOG_INFO("{} starting", GetName());
+  }
   if (!game_data_root_.empty()) {
     REXLOG_INFO("  Game directory: {}", game_data_root_.string());
   }
@@ -580,22 +638,75 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
+  // Candidate graphics backends in preference order. The gpu_backend cvar
+  // (already loaded from the config/settings files by SetupEnvironment)
+  // reorders the list at runtime; "auto" keeps Direct3D 12 first when it is
+  // compiled in.
+  struct GraphicsCandidate {
+    const char* id;    // gpu_backend cvar value
+    const char* name;  // log-facing name
+    std::unique_ptr<rex::system::IGraphicsSystem> (*make)();
+  };
+  std::vector<GraphicsCandidate> candidates;
 #if REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-#elif REX_HAS_VULKAN
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
+  candidates.push_back({"d3d12", "Direct3D 12", []() -> std::unique_ptr<rex::system::IGraphicsSystem> {
+                          return std::make_unique<rex::graphics::d3d12::D3D12GraphicsSystem>();
+                        }});
 #endif
+#if REX_HAS_VULKAN
+  candidates.push_back({"vulkan", "Vulkan", []() -> std::unique_ptr<rex::system::IGraphicsSystem> {
+                          return std::make_unique<rex::graphics::vulkan::VulkanGraphicsSystem>();
+                        }});
+#endif
+  const std::string requested = REXCVAR_GET(gpu_backend);
+  if (requested != "auto" && !candidates.empty()) {
+    bool available = false;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (requested == candidates[i].id) {
+        GraphicsCandidate wanted = candidates[i];
+        candidates.erase(candidates.begin() + i);
+        candidates.insert(candidates.begin(), wanted);
+        available = true;
+        break;
+      }
+    }
+    if (!available) {
+      REXLOG_WARN("gpu_backend={} is not available in this build; using {}", requested,
+                  candidates[0].id);
+    }
+  }
+
+  size_t candidate_index = 0;
+  if (!candidates.empty()) {
+    config_.graphics = candidates[candidate_index].make();
+  }
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 
+  rex::system::IGraphicsSystem* selected_graphics = config_.graphics.get();
   OnPreSetup(config_);
+  // A consumer may substitute its own graphics system in OnPreSetup; the
+  // candidate fallback below only applies to the stock selection.
+  const bool stock_graphics = config_.graphics.get() == selected_graphics;
 
   if (config_.graphics) {
-    X_STATUS status = config_.graphics->SetupPresentation(&app_context());
-    if (XFAILED(status)) {
+    for (;;) {
+      X_STATUS status = config_.graphics->SetupPresentation(&app_context());
+      if (!XFAILED(status)) {
+        if (stock_graphics && !candidates.empty()) {
+          REXLOG_INFO("Graphics backend: {} (gpu_backend={})",
+                      candidates[candidate_index].name, requested);
+        }
+        break;
+      }
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
-      return false;
+      if (!stock_graphics || candidate_index + 1 >= candidates.size()) {
+        return false;
+      }
+      ++candidate_index;
+      REXLOG_WARN("Trying the {} graphics backend instead", candidates[candidate_index].name);
+      config_.graphics = candidates[candidate_index].make();
     }
   }
 
@@ -652,6 +763,28 @@ bool ReXApp::SetupPresentation() {
         if (REXCVAR_GET(show_fps_counter)) {
           fps_overlay_ = std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
         }
+        // The settings menu (and console/config reload) write show_fps_counter
+        // through cvar::SetFlagByName - without a change callback the value
+        // only stuck on disk and the overlay object never followed (the menu
+        // toggle looked dead). Add/RemoveDialog are safe mid-draw: the drawer
+        // iterates by index and adjusts it on removal. The F2 bind above
+        // already syncs the overlay itself before setting the cvar, so this
+        // callback no-ops for that path.
+        rex::cvar::RegisterChangeCallback(
+            "show_fps_counter", [this, presenter](std::string_view, std::string_view) {
+              const bool want = REXCVAR_GET(show_fps_counter);
+              if (want == (fps_overlay_ != nullptr)) {
+                return;
+              }
+              if (want) {
+                fps_overlay_ =
+                    std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
+              } else {
+                fps_overlay_.reset();
+              }
+              presenter->SetGuestFrameStatsEnabled(fps_overlay_ != nullptr ||
+                                                   debug_overlay_ != nullptr);
+            });
         rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
           if (debug_overlay_) {
             debug_overlay_.reset();
@@ -794,9 +927,7 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
-#if REX_PLATFORM_LINUX
-  StartForcedExitWatchdog("Linux window close");
-#endif
+  StartForcedExitWatchdog("Window close");
   shutting_down_.store(true, std::memory_order_release);
 #if REX_PLATFORM_MAC
   if (main_thread_ && main_thread_->is_running()) {
@@ -821,13 +952,22 @@ void ReXApp::OnDestroy() {
 #endif
 
   // Unregister overlay keybinds before destroying dialogs
+  rex::ui::UnregisterBind("bind_fps_counter");
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+<<<<<<< HEAD
   rex::ui::UnregisterBind("bind_game_settings");
 
   // ImGui cleanup (reverse of setup)
   simple_settings_overlay_.reset();
+=======
+  // The show_fps_counter callback captures `this` - drop it before teardown.
+  rex::cvar::UnregisterChangeCallbacks("show_fps_counter");
+
+  // ImGui cleanup (reverse of setup)
+  fps_overlay_.reset();
+>>>>>>> 7eb0faf
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

@@ -25,6 +25,7 @@
 #include <rex/ui/window_listener.h>
 
 struct ImDrawData;
+struct ImFont;
 struct ImFontAtlas;
 struct ImGuiContext;
 struct ImGuiIO;
@@ -45,8 +46,22 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   ImGuiIO& GetIO();
   bool HasDialogs() const { return !dialogs_.empty(); }
 
+  // Proportional system UI font for styled overlays (and a heavier weight for
+  // headings), loaded in SetupFonts from per-platform system font paths.
+  // Nullptr when no suitable system font was found - callers fall back to the
+  // default font (PushFont(nullptr, size)).
+  ImFont* ui_font() const { return ui_font_; }
+  ImFont* ui_font_semibold() const { return ui_font_semibold_; }
+  ImFont* ui_font_bold() const { return ui_font_bold_; }
+  // Coverage-thinned variants for DARK text on LIGHT backgrounds (see
+  // SetupFonts); same metrics as the plain fonts.
+  ImFont* ui_font_on_light() const { return ui_font_on_light_; }
+  ImFont* ui_font_semibold_on_light() const { return ui_font_semibold_on_light_; }
+
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
+
+  Presenter* presenter() const { return presenter_; }
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -75,10 +90,20 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void SetupFontTexture();
 
+  void SetupFonts();
+
+  // Services ImGui's texture create/update/destroy requests when
+  // ImGuiBackendFlags_RendererHasTextures is active.
+  void ProcessImGuiTextureRequests(ImDrawData* data);
+
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
+
+  void AddDialogImpl(ImGuiDialog* dialog);
+  void RemoveDialogImpl(ImGuiDialog* dialog);
 
   void ClearInput();
   void OnKey(KeyEvent& e, bool is_down);
+  static int MouseEventButtonToImGui(const MouseEvent& e);
   void UpdateMousePosition(float x, float y);
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
@@ -92,6 +117,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   FontSetupCallback font_setup_;
 
   ImGuiContext* internal_state_ = nullptr;
+
+  // System UI fonts (see ui_font()). Owned by the ImGui font atlas.
+  ImFont* ui_font_ = nullptr;
+  ImFont* ui_font_semibold_ = nullptr;
+  ImFont* ui_font_bold_ = nullptr;
+  ImFont* ui_font_on_light_ = nullptr;
+  ImFont* ui_font_semibold_on_light_ = nullptr;
 
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
@@ -107,6 +139,18 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+  // Textures created on ImGui's request when ImGuiBackendFlags_RendererHasTextures
+  // is active (dynamic glyph rasterization); keyed back to ImGui via TexID.
+  std::vector<std::unique_ptr<ImmediateTexture>> imgui_managed_textures_;
+
+  // Bit mask of ImGui mouse buttons the drawer has seen pressed, used for
+  // window mouse capture bookkeeping (io.MouseDown can't be used - input is
+  // queued via the ImGui event API and only reflected at NewFrame).
+  uint32_t mouse_buttons_down_ = 0;
+
+  // Whether the platform window has been asked to activate text input
+  // (character event delivery / IME) because a text widget is active.
+  bool text_input_active_ = false;
 
   // If there's an active pointer, the ImGui mouse is controlled by this touch.
   // If it's TouchEvent::kPointerIDNone, the ImGui mouse is controlled by the

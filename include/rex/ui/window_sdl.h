@@ -25,8 +25,11 @@ class SDLWindow final : public Window {
 
   static void HandleSDLEvent(const SDL_Event& event);
 
+  void SetTextInputActive(bool active) override;
+
  protected:
   uint32_t GetLatestDpiImpl() const override;
+  float QueryDisplayRefreshHzImpl() const override;
   bool OpenImpl() override;
   void RequestCloseImpl() override;
 
@@ -51,6 +54,8 @@ class SDLWindow final : public Window {
                          WindowDestructionReceiver& destruction_receiver);
   void HandleMouseWheel(const SDL_MouseWheelEvent& event,
                         WindowDestructionReceiver& destruction_receiver);
+  void HandleTextInput(const SDL_TextInputEvent& event,
+                       WindowDestructionReceiver& destruction_receiver);
   void RevealAutoHiddenCursor();
   void SetCursorAutoHideTimer();
   void RemoveCursorAutoHideTimer();

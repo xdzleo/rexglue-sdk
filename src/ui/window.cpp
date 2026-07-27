@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <iterator>
 
 #include <rex/assert.h>
@@ -59,6 +61,34 @@ REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "GPU", "Guest video mode re
 
 namespace rex {
 namespace ui {
+
+namespace {
+// Process-wide display refresh cache (see Window::CachedDisplayRefreshHz):
+// written on the UI thread, read from any thread (frame pacers, settings UI).
+std::atomic<float> g_display_refresh_hz{0.0f};
+}  // namespace
+
+float Window::CachedDisplayRefreshHz() {
+  return g_display_refresh_hz.load(std::memory_order_relaxed);
+}
+
+void Window::UpdateCachedDisplayRefresh() {
+  const float hz = QueryDisplayRefreshHzImpl();
+  if (hz > 0.0f) {
+    g_display_refresh_hz.store(hz, std::memory_order_relaxed);
+  }
+}
+
+float Window::AutoFrameCapHz(float refresh_hz) {
+  if (refresh_hz < 30.0f) {
+    return 0.0f;
+  }
+  // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
+  // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
+  // present slack at 144 Hz, within routine thread-scheduling jitter.
+  const float margin = std::max(4.0f, refresh_hz * 0.05f);
+  return std::floor(refresh_hz - margin);
+}
 
 Window::Window(WindowedAppContext& app_context, const std::string_view title,
                uint32_t desired_logical_width, uint32_t desired_logical_height)
@@ -221,6 +251,7 @@ bool Window::Open() {
     return true;
   }
   phase_ = Phase::kOpen;
+  UpdateCachedDisplayRefresh();
 
   // Call the listeners (OnOpened with all the new state so the listeners are
   // aware that they can start interacting with the open Window, and after that,
@@ -541,6 +572,11 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
     return;
   }
   has_focus_ = new_has_focus;
+  if (has_focus_) {
+    // Focus gain is the cheapest reliable moment to notice the window moved
+    // to a display with a different refresh rate.
+    UpdateCachedDisplayRefresh();
+  }
   UISetupEvent e(this);
   if (has_focus_) {
     SendEventToListeners([&e](auto listener) { listener->OnGotFocus(e); }, destruction_receiver);
@@ -571,6 +607,12 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
 }
 
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  if (!e.prev_state() && e.virtual_key() == VirtualKey::kF10 &&
+      (rex::cvar::Query<bool>("skate3_demo_path") ||
+       rex::cvar::Query<bool>("skate3_demo_path_probe"))) {
+    REXLOG_WARN("Skate 3 demo path: raw F10 milestone marker");
+  }
+
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyDown(e);

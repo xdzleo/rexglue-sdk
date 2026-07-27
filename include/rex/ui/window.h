@@ -217,6 +217,20 @@ class Window {
     return dpi ? dpi : GetMediumDpi();
   }
 
+  // Last known refresh rate (Hz) of the display a window occupies, 0 while
+  // unknown. Published by the common code on window open and focus gain;
+  // readable from any thread (frame pacers, settings UI).
+  static float CachedDisplayRefreshHz();
+
+  // Refresh-derived automatic frame cap for the given display refresh rate,
+  // 0 while the refresh is unknown. Presents run with tearing allowed, so on
+  // a VRR display any present arriving faster than the panel's minimum
+  // refresh period tears; the cap must sit far enough below the refresh rate
+  // that swap-to-present jitter cannot cross it. A fixed margin that is
+  // ample at 60 Hz is too thin at 144 Hz, so the margin scales with the
+  // refresh rate. Single source of the policy for pacers and settings UI.
+  static float AutoFrameCapHz(float refresh_hz);
+
   // Round trips are not guaranteed to return the same results.
   static constexpr uint32_t ConvertSizeDpi(uint32_t size, uint32_t new_dpi, uint32_t old_dpi) {
     // Always rounding up to prevent zero sizes (unless the input is zero) as
@@ -310,6 +324,14 @@ class Window {
   // the cursor in fullscreen, to allow going into the fullscreen mode to hide
   // the cursor instantly.
   void SetCursorVisibility(CursorVisibility new_cursor_visibility);
+
+  // Enables or disables platform text input (character event delivery / IME)
+  // while a text widget is active. Characters are delivered to input listeners
+  // via OnKeyChar. On some platforms character events are always delivered
+  // (Win32 WM_CHAR, GTK) and this is a no-op; on SDL, character events are
+  // only delivered while text input is started, so this must be kept in sync
+  // by whoever hosts text widgets (done by ImGuiDrawer).
+  virtual void SetTextInputActive(bool /*active*/) {}
 
   bool HasFocus() const { return HasActualState() ? has_focus_ : false; }
   // May be applied in a delayed way or dropped at all, HasFocus will not
@@ -434,6 +456,14 @@ class Window {
   // such as the last DPI from an existing window, the system DPI, or just the
   // medium DPI (0 returned from it will also be treated as medium DPI).
   virtual uint32_t GetLatestDpiImpl() const { return GetMediumDpi(); }
+
+  // Refresh rate (Hz) of the display the window currently occupies, or 0 when
+  // the platform can't report it. UI thread only (native display queries);
+  // consumers on other threads read the cache below.
+  virtual float QueryDisplayRefreshHzImpl() const { return 0.0f; }
+  // Re-query the display refresh rate and publish it to the process-wide
+  // cache (UI thread; called by the common code on open and focus gain).
+  void UpdateCachedDisplayRefresh();
 
   // Deletion of the window may (and must) not happen in OpenImpl, the listeners
   // are deferred, so there's no need to use WindowDestructionReceiver in it.

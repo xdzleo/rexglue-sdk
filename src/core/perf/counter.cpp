@@ -689,9 +689,7 @@ bool ShouldCollectDrawDiagnostics() {
 }
 
 bool ShouldCollectDrawFingerprints() {
-  return REXCVAR_GET(perf_draw_fingerprints) ||
-         rex::cvar::Query<bool>("skate3_ultrawide_trace_draws") ||
-         ShouldCollectDrawDiagnostics();
+  return REXCVAR_GET(perf_draw_fingerprints) || ShouldCollectDrawDiagnostics();
 }
 
 int64_t GetCounter(CounterId id) {

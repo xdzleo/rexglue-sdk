@@ -43,18 +43,25 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_BOOL(vulkan_direct_resolve_fast32, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_direct_resolve_fast32, false, "GPU/Vulkan",
                     "Resolve single-sampled 32bpp color render targets with a single compute "
                     "dispatch reading the host render target directly, instead of the render "
                     "target dump -> EDRAM buffer -> copy round trip (requires "
                     "direct_host_resolve)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, false, "GPU/Vulkan",
                     "Defer resolve clears of host render targets and replay them inside the next "
                     "render pass binding the render target, instead of a dedicated render pass "
                     "with an attachment clear per resolve")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_inexact_rt_transfers, false, "GPU/Vulkan",
+                    "Allow the host render target path on devices lacking integer sampled-image "
+                    "MSAA or UINT transfer format support, degrading render target ownership "
+                    "transfers from bit-exact to approximate (for non-conformant drivers such as "
+                    "Vulkan-on-D3D12, where the fragment shader interlock path is unavailable)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
 //     render_target_path_vulkan, "",
@@ -429,6 +436,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           "can't be bit-exact on this device; switching to fragment shader "
           "interlock path for D3D12 parity");
       path_ = Path::kPixelShaderInterlock;
+    } else if (REXCVAR_GET(vulkan_allow_inexact_rt_transfers)) {
+      REXGPU_WARN(
+          "VulkanRenderTargetCache: Proceeding with non-bit-exact host render "
+          "target ownership transfers (vulkan_allow_inexact_rt_transfers); "
+          "emulated rendering may be inaccurate on this device");
     } else {
       REXGPU_ERROR(
           "VulkanRenderTargetCache: Bit-exact host render target ownership "
@@ -1546,7 +1558,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Submit the resolve.
           if (draw_resolution_scaled) {
-            texture_cache.UseScaledResolveBufferForWrite(copy_dest_base, copy_dest_range_length);
+            texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
           } else {
             shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),

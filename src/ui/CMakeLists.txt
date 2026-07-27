@@ -2,6 +2,8 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    fonts_inter.cpp
+    graphics_device_list.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
@@ -27,9 +29,9 @@ set(REXUI_OVERLAY_SOURCES
     overlay/fps_overlay.cpp
     overlay/acquire_wizard_overlay.cpp
     overlay/install_wizard_overlay.cpp
+    overlay/wizard_screen.cpp
     overlay/simple_settings_overlay.cpp
     overlay/settings_overlay.cpp
-    overlay/ultrawide_targets_overlay.cpp
 )
 
 # Vulkan UI backend

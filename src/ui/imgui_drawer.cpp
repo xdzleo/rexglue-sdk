@@ -11,19 +11,25 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <string>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
+#include <rex/ui/fonts_inter.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
+#include <rex/ui/windowed_app_context.h>
 
 #include <imgui.h>
+#include <misc/freetype/imgui_freetype.h>
 
 namespace rex {
 namespace ui {
@@ -44,11 +50,11 @@ ImGuiDrawer::~ImGuiDrawer() {
   SetPresenter(nullptr);
   if (!dialogs_.empty()) {
     window_->RemoveInputListener(this);
-    if (internal_state_) {
-      ImGui::SetCurrentContext(internal_state_);
-      if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
-        window_->ReleaseMouse();
-      }
+    if (touch_pointer_id_ == TouchEvent::kPointerIDNone && mouse_buttons_down_) {
+      window_->ReleaseMouse();
+    }
+    if (text_input_active_) {
+      window_->SetTextInputActive(false);
     }
   }
   if (internal_state_) {
@@ -59,6 +65,20 @@ ImGuiDrawer::~ImGuiDrawer() {
 
 void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
+  // Dialogs may be constructed on kernel/guest threads (XamShow*UI dispatch);
+  // the dialog list, the window input listener list and the presenter UI
+  // drawer list are all UI-thread state, so marshal to the UI thread. If the
+  // UI loop is already gone (shutdown), skip - the dialog will never be drawn
+  // and the dispatch path deletes it.
+  WindowedAppContext& app_context = window_->app_context();
+  if (!app_context.IsInUIThread()) {
+    app_context.CallInUIThreadSynchronous([this, dialog]() { AddDialogImpl(dialog); });
+    return;
+  }
+  AddDialogImpl(dialog);
+}
+
+void ImGuiDrawer::AddDialogImpl(ImGuiDialog* dialog) {
   // Check if already added.
   if (std::find(dialogs_.cbegin(), dialogs_.cend(), dialog) != dialogs_.cend()) {
     return;
@@ -78,6 +98,15 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
+  WindowedAppContext& app_context = window_->app_context();
+  if (!app_context.IsInUIThread()) {
+    app_context.CallInUIThreadSynchronous([this, dialog]() { RemoveDialogImpl(dialog); });
+    return;
+  }
+  RemoveDialogImpl(dialog);
+}
+
+void ImGuiDrawer::RemoveDialogImpl(ImGuiDialog* dialog) {
   auto it = std::find(dialogs_.cbegin(), dialogs_.cend(), dialog);
   if (it == dialogs_.cend()) {
     return;
@@ -106,38 +135,16 @@ void ImGuiDrawer::Initialize() {
   // Windows.
   io.IniFilename = nullptr;
 
-  // Setup the font glyphs.
-  ImFontConfig font_config;
-  font_config.OversampleH = font_config.OversampleV = 1;
-  font_config.PixelSnapH = true;
-  static const ImWchar font_glyph_ranges[] = {
-      0x0020,
-      0x00FF,  // Basic Latin + Latin Supplement
-      0,
-  };
-  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
-                                                 &font_config, font_glyph_ranges);
+  SetupFonts();
 
-#if REX_PLATFORM_WIN32
-  // TODO(benvanik): jp font on other platforms?
-  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
-  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
-  if (std::filesystem::exists(jp_font_path)) {
-    ImFontConfig jp_font_config;
-    jp_font_config.MergeMode = true;
-    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
-    jp_font_config.PixelSnapH = true;
-    jp_font_config.FontNo = 0;
-    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
-                                 io.Fonts->GetGlyphRangesJapanese());
-  } else {
-    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
-  }
-#endif
-
-  if (font_setup_) {
-    font_setup_(io.Fonts);
-  }
+  // Dialogs push runtime font sizes (PushFont(font, 18..40)); the legacy
+  // prebaked atlas can only bitmap-scale its 10px bake to serve them, which
+  // blurs. With this flag glyphs rasterize on demand at the drawn size, and
+  // io.DisplayFramebufferScale (set per-frame in Draw on macOS) additionally
+  // rasterizes them at Retina display pixel density while layout stays
+  // logical. The texture create/update requests are serviced by
+  // ProcessImGuiTextureRequests through the platform-agnostic ImmediateDrawer.
+  io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
   auto& style = ImGui::GetStyle();
   style.ScrollbarRounding = 0;
@@ -265,9 +272,19 @@ std::optional<ImGuiKey> ImGuiDrawer::VirtualKeyToImGuiKey(VirtualKey vkey) {
       {ui::VirtualKey::kF11, ImGuiKey_F11},
       {ui::VirtualKey::kF12, ImGuiKey_F12},
       // Modifiers
+      // Win32 sends the generic VKs (WM_KEYDOWN gives VK_SHIFT etc.), SDL and
+      // GTK send the sided ones - both must be mapped.
       {ui::VirtualKey::kShift, ImGuiKey_LeftShift},
       {ui::VirtualKey::kControl, ImGuiKey_LeftCtrl},
       {ui::VirtualKey::kMenu, ImGuiKey_LeftAlt},
+      {ui::VirtualKey::kLShift, ImGuiKey_LeftShift},
+      {ui::VirtualKey::kRShift, ImGuiKey_RightShift},
+      {ui::VirtualKey::kLControl, ImGuiKey_LeftCtrl},
+      {ui::VirtualKey::kRControl, ImGuiKey_RightCtrl},
+      {ui::VirtualKey::kLMenu, ImGuiKey_LeftAlt},
+      {ui::VirtualKey::kRMenu, ImGuiKey_RightAlt},
+      {ui::VirtualKey::kLWin, ImGuiKey_LeftSuper},
+      {ui::VirtualKey::kRWin, ImGuiKey_RightSuper},
       {ui::VirtualKey::kCapital, ImGuiKey_CapsLock},
       {ui::VirtualKey::kNumLock, ImGuiKey_NumLock},
       {ui::VirtualKey::kScroll, ImGuiKey_ScrollLock},
@@ -309,11 +326,192 @@ std::optional<ImGuiKey> ImGuiDrawer::VirtualKeyToImGuiKey(VirtualKey vkey) {
   }
 }
 
+void ImGuiDrawer::SetupFonts() {
+  ImGuiIO& io = GetIO();
+  io.Fonts->Clear();
+
+  ImFontConfig font_config;
+  font_config.OversampleH = font_config.OversampleV = 1;
+  font_config.PixelSnapH = true;
+  static const ImWchar font_glyph_ranges[] = {
+      0x0020,
+      0x00FF,  // Basic Latin + Latin Supplement
+      0,
+  };
+  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
+                                                 &font_config, font_glyph_ranges);
+
+#if REX_PLATFORM_WIN32
+  // TODO(benvanik): jp font on other platforms?
+  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
+  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
+  if (std::filesystem::exists(jp_font_path)) {
+    ImFontConfig jp_font_config;
+    jp_font_config.MergeMode = true;
+    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
+    jp_font_config.PixelSnapH = true;
+    jp_font_config.FontNo = 0;
+    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
+                                 io.Fonts->GetGlyphRangesJapanese());
+  } else {
+    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
+  }
+#endif
+
+  if (font_setup_) {
+    font_setup_(io.Fonts);
+  }
+
+  // UI fonts for styled overlays. Embedded Inter (OFL-licensed Latin subset,
+  // fonts_inter.cpp) so every platform renders identically; system fonts are
+  // only a fallback. With ImGuiBackendFlags_RendererHasTextures the size
+  // given here is only the default - glyphs rasterize at whatever size is
+  // pushed. MUST run after font_setup_: app callbacks (e.g. Skate3's
+  // OnConfigureFonts) may Clear() the atlas, which deletes every ImFont
+  // loaded before them - fonts cached here would dangle.
+  {
+    ImFontConfig config;
+    // FreeType rasterization WITHOUT hinting: light hinting's blue-zone
+    // snapping rounded the x-height down at the menu sizes and read as
+    // vertically squished (playtest). Unhinted FreeType keeps the design
+    // proportions exactly while still rasterizing curves cleaner than stb.
+    // Advances stay fractional (browser letter spacing); the Oversample
+    // fields are ignored by the FreeType loader.
+    config.OversampleH = 1;
+    config.OversampleV = 1;
+    config.PixelSnapH = false;
+    config.RasterizerMultiply = 1.0f;
+    // Light-on-dark coverage gamma (rexglue imgui patch): browsers blend text
+    // gamma-aware, which renders light glyphs on dark backgrounds fatter and
+    // brighter than plain sRGB alpha blending: alpha^0.62 matches
+    // DirectWrite white-on-black edge
+    // profiles (identity was measurably thinner/dimmer). The *_on_light_
+    // variants below keep gamma 1.0 - dark-on-light needs no correction.
+    config.RasterizerGamma = 0.62f;
+    config.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+    ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterRegularCompressedBase85(), 18.0f, &config);
+    ui_font_semibold_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterSemiBoldCompressedBase85(), 18.0f, &config);
+    ui_font_bold_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterBoldCompressedBase85(), 18.0f, &config);
+    // DARK-ON-LIGHT variants: naive sRGB alpha blending renders dark text on
+    // light panels measurably fatter and softer than the browser (stems 4.94
+    // vs 4.70 px, vertical edge gradient 73 vs 92) - the
+    // browser's text engine gamma-adjusts coverage per polarity. A coverage
+    // multiply < 1 approximates that for dark-on-light; light-on-dark keeps
+    // the plain 1.0 fonts above. Metrics are identical across variants.
+    ImFontConfig config_on_light = config;
+    // 1.0 = currently identical to the plain fonts: the 0.8 coverage-thinning
+    // experiment read as "lighter, not sharper" in playtest. Kept as the
+    // per-polarity tuning knob.
+    config_on_light.RasterizerMultiply = 1.0f;
+    // Dark-on-light matches the browser with NO coverage curve (harness fit:
+    // identity beat every contrast/gamma variant once bake==draw size).
+    config_on_light.RasterizerGamma = 1.0f;
+    ui_font_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterRegularCompressedBase85(), 18.0f, &config_on_light);
+    ui_font_semibold_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterSemiBoldCompressedBase85(), 18.0f, &config_on_light);
+  }
+  auto add_first_available = [&io](const std::vector<std::string>& paths) -> ImFont* {
+    for (const std::string& path : paths) {
+      if (!std::filesystem::exists(path)) {
+        continue;
+      }
+      ImFontConfig config;
+      config.FontNo = 0;
+      if (ImFont* font = io.Fonts->AddFontFromFileTTF(path.c_str(), 18.0f, &config)) {
+        return font;
+      }
+    }
+    return nullptr;
+  };
+#if REX_PLATFORM_WIN32
+  // Helvetica family first (per-user font dir too - user-installed fonts land
+  // in %LOCALAPPDATA%, not C:\Windows\Fonts); Arial is a metric-compatible
+  // Helvetica clone every Windows ships, Segoe UI is the last resort.
+  std::string user_font_dir;
+  if (const char* local_appdata = std::getenv("LOCALAPPDATA")) {
+    user_font_dir = std::string(local_appdata) + "\\Microsoft\\Windows\\Fonts\\";
+  }
+  auto win_font_paths = [&user_font_dir](std::initializer_list<const char*> names) {
+    std::vector<std::string> paths;
+    for (const char* name : names) {
+      if (!user_font_dir.empty()) {
+        paths.push_back(user_font_dir + name);
+      }
+      paths.push_back(std::string("C:\\Windows\\Fonts\\") + name);
+    }
+    return paths;
+  };
+  if (!ui_font_) {
+    ui_font_ = add_first_available(win_font_paths(
+        {"HelveticaNowText-Regular.ttf", "HelveticaNowDisplay-Regular.ttf",
+         "HelveticaNow-Regular.ttf", "Helvetica.ttf", "HelveticaNeue.ttf", "arial.ttf",
+         "segoeui.ttf"}));
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = add_first_available(win_font_paths(
+        {"HelveticaNowText-Bold.ttf", "HelveticaNowDisplay-Bold.ttf", "HelveticaNow-Bold.ttf",
+         "Helvetica-Bold.ttf", "HelveticaNeue-Bold.ttf", "arialbd.ttf", "seguisb.ttf",
+         "segoeuib.ttf"}));
+  }
+#elif defined(__APPLE__)
+  if (!ui_font_) {
+    ui_font_ = add_first_available({"/System/Library/Fonts/Helvetica.ttc",
+                                    "/System/Library/Fonts/Supplemental/Arial.ttf"});
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ =
+        add_first_available({"/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                             "/System/Library/Fonts/Helvetica.ttc"});
+  }
+#else
+  if (!ui_font_) {
+    ui_font_ = add_first_available(
+        {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+         "/usr/share/fonts/noto/NotoSans-Regular.ttf"});
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = add_first_available(
+        {"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+         "/usr/share/fonts/noto/NotoSans-Bold.ttf"});
+  }
+#endif
+  if (!ui_font_) {
+    REXLOG_WARN("No system UI font found; styled overlays use the default font");
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = ui_font_;
+  }
+  if (!ui_font_bold_) {
+    ui_font_bold_ = ui_font_semibold_;
+  }
+  if (!ui_font_on_light_) {
+    ui_font_on_light_ = ui_font_;
+  }
+  if (!ui_font_semibold_on_light_) {
+    ui_font_semibold_on_light_ = ui_font_semibold_;
+  }
+  REXLOG_INFO("imgui fonts: drawer={} atlas={} count={} ui={} uisb={}", (void*)this,
+              (void*)io.Fonts, io.Fonts->Fonts.Size, (void*)ui_font_, (void*)ui_font_semibold_);
+}
+
 void ImGuiDrawer::SetupFontTexture() {
   if (font_texture_ || !immediate_drawer_) {
     return;
   }
   ImGuiIO& io = GetIO();
+  if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+    // Textures are created on demand in ProcessImGuiTextureRequests; the
+    // legacy whole-atlas prebake must not run.
+    return;
+  }
   unsigned char* pixels;
   int width, height;
   io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
@@ -345,8 +543,20 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
     return;
   }
   if (immediate_drawer_) {
-    GetIO().Fonts->TexID = ImTextureID{};
+    ImGuiIO& io = GetIO();
+    io.Fonts->TexID = ImTextureID{};
     font_texture_.reset();
+    if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+      // Hand dynamic textures back to ImGui as destroyed so it re-requests
+      // creation from the next immediate drawer.
+      for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
+        if (tex->TexID != ImTextureID_Invalid) {
+          tex->SetTexID(ImTextureID_Invalid);
+          tex->SetStatus(ImTextureStatus_Destroyed);
+        }
+      }
+      imgui_managed_textures_.clear();
+    }
   }
   immediate_drawer_ = new_immediate_drawer;
   if (immediate_drawer_) {
@@ -371,6 +581,22 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   ImGuiIO& io = ImGui::GetIO();
 
+  // The UI coordinate space is PHYSICAL pixels, 1:1 with the render target -
+  // no logical->physical magnification anywhere in the UI path. Under a
+  // fractional OS scale (e.g. Windows 150%) a logical coordinate space cannot
+  // be blur-free: the GPU stretch lands half the pixel-snapped positions
+  // between physical pixels, and glyph texels can never all align. Glyphs now
+  // rasterize at their physical size directly, so density compensation
+  // (DisplayFramebufferScale, the old Retina fix) must stay 1.
+  io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+  // Widget-based dialogs (message boxes, wizards, fps overlay) author their
+  // font sizes in logical units - FontScaleDpi keeps their on-screen size
+  // across DPI scales while text rasterizes at physical resolution. Explicit
+  // ImDrawList::AddText sizes (the settings overlay) are unaffected by it.
+  // Per-frame because the window can move between monitors with different
+  // scales.
+  ImGui::GetStyle().FontScaleDpi = float(window_->GetDpi()) / float(window_->GetMediumDpi());
+
   uint64_t current_frame_time_ticks = rex::chrono::Clock::QueryHostTickCount();
   io.DeltaTime =
       float(double(current_frame_time_ticks - last_frame_time_ticks_) / frame_time_tick_frequency_);
@@ -381,9 +607,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
   last_frame_time_ticks_ = current_frame_time_ticks;
 
-  float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
-  io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+  io.DisplaySize.x = float(window_->GetActualPhysicalWidth());
+  io.DisplaySize.y = float(window_->GetActualPhysicalHeight());
 
   ImGui::NewFrame();
 
@@ -402,7 +627,15 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   if (reset_mouse_position_after_next_frame_) {
     reset_mouse_position_after_next_frame_ = false;
-    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+  }
+
+  // Keep the platform text input state in sync with whether a text widget is
+  // active (SDL only delivers character events while text input is started).
+  bool want_text_input = io.WantTextInput && !dialogs_.empty();
+  if (want_text_input != text_input_active_) {
+    text_input_active_ = want_text_input;
+    window_->SetTextInputActive(want_text_input);
   }
 
   // Detaching is deferred if the last dialog is removed during drawing, perform
@@ -416,8 +649,54 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
 }
 
+void ImGuiDrawer::ProcessImGuiTextureRequests(ImDrawData* data) {
+  if (!data->Textures) {
+    return;
+  }
+  for (ImTextureData* tex : *data->Textures) {
+    switch (tex->Status) {
+      case ImTextureStatus_WantCreate:
+      case ImTextureStatus_WantUpdates: {
+        // The ImmediateDrawer has no partial-update API - recreate the whole
+        // texture from ImGui's CPU-side copy. This only happens when new
+        // glyph sizes/densities are first drawn, then the atlas settles.
+        assert_true(tex->Format == ImTextureFormat_RGBA32);
+        auto texture = immediate_drawer_->CreateTexture(
+            uint32_t(tex->Width), uint32_t(tex->Height), ImmediateTextureFilter::kLinear, true,
+            static_cast<const uint8_t*>(tex->GetPixels()));
+        if (tex->TexID != ImTextureID_Invalid) {
+          auto* old_texture = reinterpret_cast<ImmediateTexture*>(tex->TexID);
+          std::erase_if(imgui_managed_textures_,
+                        [old_texture](const auto& t) { return t.get() == old_texture; });
+        }
+        tex->SetTexID(reinterpret_cast<ImTextureID>(texture.get()));
+        tex->SetStatus(ImTextureStatus_OK);
+        imgui_managed_textures_.push_back(std::move(texture));
+        break;
+      }
+      case ImTextureStatus_WantDestroy: {
+        if (tex->UnusedFrames < 1) {
+          break;
+        }
+        auto* old_texture = reinterpret_cast<ImmediateTexture*>(tex->TexID);
+        std::erase_if(imgui_managed_textures_,
+                      [old_texture](const auto& t) { return t.get() == old_texture; });
+        tex->SetTexID(ImTextureID_Invalid);
+        tex->SetStatus(ImTextureStatus_Destroyed);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
 void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context) {
   ImGuiIO& io = ImGui::GetIO();
+
+  if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+    ProcessImGuiTextureRequests(data);
+  }
 
   immediate_drawer_->Begin(ui_draw_context, io.DisplaySize.x, io.DisplaySize.y);
 
@@ -476,30 +755,40 @@ void ImGuiDrawer::OnKeyChar(KeyEvent& e) {
   }
 }
 
+int ImGuiDrawer::MouseEventButtonToImGui(const MouseEvent& e) {
+  switch (e.button()) {
+    case rex::ui::MouseEvent::Button::kLeft:
+      return 0;
+    case rex::ui::MouseEvent::Button::kRight:
+      return 1;
+    default:
+      // Ignored.
+      return -1;
+  }
+}
+
 void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
-  int button = -1;
-  switch (e.button()) {
-    case rex::ui::MouseEvent::Button::kLeft: {
-      button = 0;
-      break;
-    }
-    case rex::ui::MouseEvent::Button::kRight: {
-      button = 1;
-      break;
-    }
-    default: {
-      // Ignored.
-      break;
-    }
-  }
-  if (button >= 0 && button < std::size(io.MouseDown)) {
-    if (!io.MouseDown[button]) {
-      if (!ImGui::IsAnyMouseDown()) {
+  int button = MouseEventButtonToImGui(e);
+  if (button >= 0) {
+    if (!(mouse_buttons_down_ & (UINT32_C(1) << button))) {
+      if (!mouse_buttons_down_) {
         window_->CaptureMouse();
       }
-      io.MouseDown[button] = true;
+      mouse_buttons_down_ |= UINT32_C(1) << button;
+    }
+    // Queue rather than write io.MouseDown directly: the event queue keeps the
+    // position-then-button ordering and spreads a same-frame press+release
+    // over multiple NewFrames, so clicks register at the position they
+    // actually happened at and fast clicks aren't lost when the UI frame rate
+    // lags behind input.
+    io.AddMouseButtonEvent(button, true);
+    if (io.WantCaptureMouse) {
+      // Keep presses over the UI out of lower-Z listeners (game input,
+      // keybinds). Releases are deliberately never eaten so lower listeners
+      // can't be left with a stuck button.
+      e.set_handled(true);
     }
   }
 }
@@ -511,35 +800,25 @@ void ImGuiDrawer::OnMouseMove(MouseEvent& e) {
 void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
-  int button = -1;
-  switch (e.button()) {
-    case rex::ui::MouseEvent::Button::kLeft: {
-      button = 0;
-      break;
-    }
-    case rex::ui::MouseEvent::Button::kRight: {
-      button = 1;
-      break;
-    }
-    default: {
-      // Ignored.
-      break;
-    }
-  }
-  if (button >= 0 && button < std::size(io.MouseDown)) {
-    if (io.MouseDown[button]) {
-      io.MouseDown[button] = false;
-      if (!ImGui::IsAnyMouseDown()) {
+  int button = MouseEventButtonToImGui(e);
+  if (button >= 0) {
+    if (mouse_buttons_down_ & (UINT32_C(1) << button)) {
+      mouse_buttons_down_ &= ~(UINT32_C(1) << button);
+      if (!mouse_buttons_down_) {
         window_->ReleaseMouse();
       }
     }
+    io.AddMouseButtonEvent(button, false);
   }
 }
 
 void ImGuiDrawer::OnMouseWheel(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
-  io.MouseWheel += float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent);
+  io.AddMouseWheelEvent(0.0f, float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent));
+  if (io.WantCaptureMouse) {
+    e.set_handled(true);
+  }
 }
 
 void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
@@ -550,8 +829,13 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
     // The latest pointer needs to be controlling the ImGui mouse.
     if (touch_pointer_id_ == TouchEvent::kPointerIDNone) {
       // Switching from the mouse to touch input.
-      if (ImGui::IsAnyMouseDown()) {
-        std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+      if (mouse_buttons_down_) {
+        for (int button = 0; button < 32; ++button) {
+          if (mouse_buttons_down_ & (UINT32_C(1) << button)) {
+            io.AddMouseButtonEvent(button, false);
+          }
+        }
+        mouse_buttons_down_ = 0;
         window_->ReleaseMouse();
       }
     }
@@ -563,27 +847,32 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
   }
   UpdateMousePosition(e.x(), e.y());
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
-    io.MouseDown[0] = false;
+    io.AddMouseButtonEvent(0, false);
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     // Make sure that after a touch, the ImGui mouse isn't hovering over
     // anything.
     reset_mouse_position_after_next_frame_ = true;
   } else {
-    io.MouseDown[0] = true;
+    io.AddMouseButtonEvent(0, true);
     reset_mouse_position_after_next_frame_ = false;
   }
 }
 
 void ImGuiDrawer::ClearInput() {
   auto& io = GetIO();
-  if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
+  if (touch_pointer_id_ == TouchEvent::kPointerIDNone && mouse_buttons_down_) {
     window_->ReleaseMouse();
   }
-  io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
-  std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+  mouse_buttons_down_ = 0;
+  io.ClearEventsQueue();
   io.ClearInputKeys();
+  io.ClearInputMouse();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
+  if (text_input_active_) {
+    text_input_active_ = false;
+    window_->SetTextInputActive(false);
+  }
 }
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
@@ -594,35 +883,48 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   }
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+    case VirtualKey::kLShift:
+    case VirtualKey::kRShift:
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+    case VirtualKey::kLControl:
+    case VirtualKey::kRControl:
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+    case VirtualKey::kLMenu:
+    case VirtualKey::kRMenu:
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+    case VirtualKey::kRWin:
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;
+  }
+  // While a text field is active, keep key presses away from app keybinds and
+  // the game (typing a name must not toggle overlays or drive MnK input).
+  // Releases always propagate so lower listeners can't get stuck keys.
+  if (is_down && io.WantTextInput) {
+    e.set_handled(true);
   }
 }
 
 void ImGuiDrawer::UpdateMousePosition(float x, float y) {
   auto& io = GetIO();
-  float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.MousePos.x = x * physical_to_logical;
-  io.MousePos.y = y * physical_to_logical;
+  // MouseEvents already carry physical pixels (WindowPointToPhysical) - the
+  // UI coordinate space is physical too, no conversion.
+  io.AddMousePosEvent(x, y);
 }
 
 void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e) {
   if (touch_pointer_id_ != TouchEvent::kPointerIDNone) {
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     auto& io = GetIO();
-    std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+    // Release the ImGui touch-driven button.
+    io.AddMouseButtonEvent(0, false);
     // Nothing needs to be done regarding CaptureMouse and ReleaseMouse - all
     // buttons as well as mouse capture have been released when switching to
     // touch input, the mouse is never captured during touch input, and now

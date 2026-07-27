@@ -403,6 +403,29 @@ uint32_t Win32Window::GetLatestDpiImpl() const {
   return dpi_;
 }
 
+float Win32Window::QueryDisplayRefreshHzImpl() const {
+  if (!hwnd_) {
+    return 0.0f;
+  }
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  if (!monitor) {
+    return 0.0f;
+  }
+  MONITORINFOEXW mi = {};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(monitor, &mi)) {
+    return 0.0f;
+  }
+  DEVMODEW dm = {};
+  dm.dmSize = sizeof(dm);
+  if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
+      !(dm.dmFields & DM_DISPLAYFREQUENCY) || dm.dmDisplayFrequency <= 1) {
+    // 0 and 1 are the documented "hardware default" sentinels.
+    return 0.0f;
+  }
+  return float(dm.dmDisplayFrequency);
+}
+
 void Win32Window::ApplyNewFullscreen() {
   // Various functions here may send messages that may result in the
   // listeners being invoked, and potentially cause the destruction of the
@@ -970,12 +993,15 @@ bool Win32Window::HandleKeyboard(UINT message, WPARAM wParam, LPARAM lParam,
              !!(GetKeyState(VK_MENU) & 0x80), !!(GetKeyState(VK_LWIN) & 0x80));
   switch (message) {
     case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
       OnKeyDown(e, destruction_receiver);
       break;
     case WM_KEYUP:
+    case WM_SYSKEYUP:
       OnKeyUp(e, destruction_receiver);
       break;
     case WM_CHAR:
+    case WM_SYSCHAR:
       OnKeyChar(e, destruction_receiver);
       break;
     default:

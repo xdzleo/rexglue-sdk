@@ -46,18 +46,6 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
 
-REXCVAR_DEFINE_BOOL(scaled_resolve_texture_loads_from_shared_memory, false, "GPU/Texture",
-                    "Materialize scaled render-to-texture resolves into guest memory on the GPU "
-                    "before loading them as regular textures")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(scaled_resolve_texture_loads_from_shared_memory_max_pixels, 1152 * 640,
-                     "GPU/Texture",
-                     "Maximum unscaled pixel count for GPU materialization of scaled "
-                     "render-to-texture resolves into guest memory")
-    .range(1, 8192 * 8192)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -76,16 +64,40 @@ REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "scaled block during resolve readback downscale")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(scaled_resolve_texture_loads_update_guest_memory, true, "GPU",
-                    "When scaled resolve texture loads are materialized into shared memory, also "
-                    "mirror the downscaled data into guest memory for CPU-visible coherency")
+REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_max_length, 0, "GPU",
+                     "When > 0, render-to-texture resolves up to this unscaled byte length are "
+                     "read back synchronously into CPU-visible guest memory even when "
+                     "readback_resolve is disabled and regardless of gameplay state. Intended "
+                     "to be ARMED TEMPORARILY by the app layer around flows where the game "
+                     "reads resolved pixels on the CPU (Skate 3 photo grab: "
+                     "ScreenshotBackEnd::GrabScreenshot JPEG-encodes a 1152x640 PostFX "
+                     "screenshot target from guest memory; without readback the saved photo "
+                     "is black). 0 disables (default).")
+    .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(scaled_resolve_small_texture_readback_max_length, 0x2D0000, "GPU/Texture",
-                     "Maximum unscaled byte length of a scaled render-to-texture resolve that "
-                     "will be immediately read back even when readback_resolve is disabled. "
-                     "This is intended for small UI thumbnails that depend on CPU-visible "
-                     "resolved data without forcing full-screen resolve readbacks.")
+REXCVAR_DEFINE_INT32(native_render_targeted_readback_min_interval_ms, 33, "GPU",
+                     "Minimum interval between the targeted always-on resolve readbacks "
+                     "(the non-gameplay Import-Skater/preview target) in milliseconds. "
+                     "Each readback is a synchronous GPU drain plus a multi-megabyte CPU "
+                     "copy; menu flows that re-resolve the preview target every frame "
+                     "(trick guide demo pages) otherwise saturate the command processor "
+                     "with hundreds of drains per second. Skipped copies leave the "
+                     "previous CPU-visible contents in place (the consumer is a preview "
+                     "image). 0 disables the throttle. Does not affect the app-armed "
+                     "photo-grab window.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_min_length, 0, "GPU",
+                     "Lower bound companion to "
+                     "native_render_force_resolve_readback_max_length: when > 0, resolves "
+                     "SHORTER than this skip the forced CPU copy (they still execute "
+                     "GPU-side). Each forced copy is a synchronous GPU drain; the Skate 3 "
+                     "photo-flow compose window uses this to skip the ~18 small per-frame "
+                     "resolves (64 KB lightmap pages, postfx aux) that made the window a "
+                     "stutter-fest, while still copying the display-card compose. 0 "
+                     "disables (default).")
     .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 

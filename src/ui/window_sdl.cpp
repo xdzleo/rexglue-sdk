@@ -27,7 +27,12 @@ constexpr uint32_t kDefaultDpi = 96;
 constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 1000;
 constexpr uint32_t kCursorAutoHideEvent = SDL_EVENT_USER + 1;
 
-REXCVAR_DEFINE_BOOL(sdl_high_pixel_density, !REX_PLATFORM_MAC, "UI/SDL",
+// Enabled on macOS: without a high-DPI backing the Metal drawable stays at
+// logical point size and CoreAnimation upscales the whole window to the Retina
+// panel, blurring everything (the settings UI most visibly). Internal 3D render
+// cost is governed separately by the resolution-scale cvars, so this only makes
+// the final composite and UI render at native panel resolution.
+REXCVAR_DEFINE_BOOL(sdl_high_pixel_density, true, "UI/SDL",
                     "Request high-DPI backing pixels for SDL windows")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -376,6 +381,9 @@ void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_UP:
       window_id = event.key.windowID;
       break;
+    case SDL_EVENT_TEXT_INPUT:
+      window_id = event.text.windowID;
+      break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
       window_id = event.button.windowID;
@@ -397,6 +405,18 @@ void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
 }
 
 uint32_t SDLWindow::GetLatestDpiImpl() const { return dpi_ ? dpi_ : kDefaultDpi; }
+
+float SDLWindow::QueryDisplayRefreshHzImpl() const {
+  if (!window_) {
+    return 0.0f;
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
+  if (!display) {
+    return 0.0f;
+  }
+  const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+  return mode != nullptr && mode->refresh_rate > 0.0f ? mode->refresh_rate : 0.0f;
+}
 
 bool SDLWindow::OpenImpl() {
   SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
@@ -589,6 +609,9 @@ void SDLWindow::HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_UP:
       HandleKey(event.key, false, destruction_receiver);
       break;
+    case SDL_EVENT_TEXT_INPUT:
+      HandleTextInput(event.text, destruction_receiver);
+      break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
       HandleMouseButton(event.button, true, destruction_receiver);
       break;
@@ -660,6 +683,68 @@ void SDLWindow::HandleMouseMotion(const SDL_MouseMotionEvent& event,
   WindowPointToPhysical(event.x, event.y, physical_x, physical_y);
   MouseEvent e(this, MouseEvent::Button::kNone, physical_x, physical_y);
   OnMouseMove(e, destruction_receiver);
+}
+
+void SDLWindow::HandleTextInput(const SDL_TextInputEvent& event,
+                                WindowDestructionReceiver& destruction_receiver) {
+  if (!event.text) {
+    return;
+  }
+  SDL_Keymod mod = SDL_GetModState();
+  const uint8_t* s = reinterpret_cast<const uint8_t*>(event.text);
+  while (*s) {
+    // Decode one UTF-8 codepoint.
+    uint32_t codepoint = 0;
+    uint32_t continuation_count = 0;
+    uint8_t lead = *s++;
+    if (lead < 0x80) {
+      codepoint = lead;
+    } else if ((lead & 0xE0) == 0xC0) {
+      codepoint = lead & 0x1F;
+      continuation_count = 1;
+    } else if ((lead & 0xF0) == 0xE0) {
+      codepoint = lead & 0x0F;
+      continuation_count = 2;
+    } else if ((lead & 0xF8) == 0xF0) {
+      codepoint = lead & 0x07;
+      continuation_count = 3;
+    } else {
+      // Stray continuation or invalid lead byte - skip.
+      continue;
+    }
+    bool valid = true;
+    for (uint32_t i = 0; i < continuation_count; ++i) {
+      uint8_t continuation = *s;
+      if ((continuation & 0xC0) != 0x80) {
+        valid = false;
+        break;
+      }
+      codepoint = (codepoint << 6) | (continuation & 0x3F);
+      ++s;
+    }
+    if (!valid || !codepoint) {
+      continue;
+    }
+    // Mirrors the Win32 WM_CHAR path - the character is carried in the
+    // KeyEvent's virtual key field.
+    KeyEvent e(this, VirtualKey(codepoint), 1, false, (mod & SDL_KMOD_SHIFT) != 0,
+               (mod & SDL_KMOD_CTRL) != 0, (mod & SDL_KMOD_ALT) != 0, (mod & SDL_KMOD_GUI) != 0);
+    OnKeyChar(e, destruction_receiver);
+    if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+      return;
+    }
+  }
+}
+
+void SDLWindow::SetTextInputActive(bool active) {
+  if (!window_) {
+    return;
+  }
+  if (active) {
+    SDL_StartTextInput(window_);
+  } else {
+    SDL_StopTextInput(window_);
+  }
 }
 
 void SDLWindow::HandleMouseWheel(const SDL_MouseWheelEvent& event,
