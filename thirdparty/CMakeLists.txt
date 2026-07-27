@@ -399,7 +399,10 @@ if(REXGLUE_ENABLE_TRACY)
     target_link_libraries(TracyClient PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
     if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_link_libraries(TracyClient PUBLIC ws2_32 dbghelp)
+        # oldnames: the target links with -nostdlib, so clang emits no default
+        # library directive for it and the POSIX aliases Tracy uses (fileno in
+        # HandleSourceCodeQuery) stay undefined at link time.
+        target_link_libraries(TracyClient PUBLIC ws2_32 dbghelp oldnames)
     endif()
 
     target_compile_definitions(TracyClient
