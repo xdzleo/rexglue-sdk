@@ -387,7 +387,17 @@ void ImGuiDrawer::SetupFonts() {
     // DirectWrite white-on-black edge
     // profiles (identity was measurably thinner/dimmer). The *_on_light_
     // variants below keep gamma 1.0 - dark-on-light needs no correction.
-    config.RasterizerGamma = 0.62f;
+    // RasterizerGamma is a private rexglue patch on their imgui submodule pin
+    // (not in public imgui 1.92.x, and the pinned commit is not published), so
+    // compile the assignment out when building against stock imgui. Text is
+    // then blended without the coverage curve - slightly fatter light-on-dark
+    // glyphs, nothing else.
+    auto set_rasterizer_gamma = []<typename T>(T& cfg, float gamma) {
+      if constexpr (requires { cfg.RasterizerGamma; }) {
+        cfg.RasterizerGamma = gamma;
+      }
+    };
+    set_rasterizer_gamma(config, 0.62f);
     config.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
     ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
         GetInterRegularCompressedBase85(), 18.0f, &config);
@@ -408,7 +418,7 @@ void ImGuiDrawer::SetupFonts() {
     config_on_light.RasterizerMultiply = 1.0f;
     // Dark-on-light matches the browser with NO coverage curve (harness fit:
     // identity beat every contrast/gamma variant once bake==draw size).
-    config_on_light.RasterizerGamma = 1.0f;
+    set_rasterizer_gamma(config_on_light, 1.0f);
     ui_font_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
         GetInterRegularCompressedBase85(), 18.0f, &config_on_light);
     ui_font_semibold_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
