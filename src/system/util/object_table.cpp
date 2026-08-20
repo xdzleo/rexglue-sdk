@@ -29,10 +29,27 @@ ObjectTable::~ObjectTable() {
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
-  // Release all objects.
+  // Release all objects. Clear the object's handle list and zero the entry's
+  // handle refcount BEFORE Release(), because Release() can be the last
+  // reference and run the destructor while this table still claims handles it
+  // is about to free anyway. That teardown artefact -- not a real leak -- is
+  // why XObject::~XObject (src/system/xobject.cpp:50-53) carries a
+  // "these are being asserted true... find out why" TODO with both
+  // assert_true(handles_.empty()) and assert_zero(pointer_ref_count_)
+  // commented out. With the clear in place, the handles_.empty() assert can be
+  // switched back on and will then catch genuine handle-accounting bugs during
+  // play instead of firing on every shutdown. Verified safe here: nothing in
+  // ~XObject or in any derived destructor (XFile, XModule, XSocket, XThread;
+  // the rest are defaulted or empty) reads handles_ or calls handle().
+  // From xenia-canary 6203d382e (src/xenia/kernel/util/object_table.cc:25-46),
+  // whose commit message states the diagnosis directly. Canary repeats the
+  // loop for host_table_; we have no host table, so this loop is the whole of
+  // it.
   for (uint32_t n = 0; n < table_capacity_; n++) {
     ObjectTableEntry& entry = table_[n];
     if (entry.object) {
+      entry.object->handles().clear();
+      entry.handle_ref_count = 0;
       entry.object->Release();
     }
   }

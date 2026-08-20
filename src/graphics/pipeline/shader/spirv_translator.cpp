@@ -154,6 +154,10 @@ void SpirvShaderTranslator::Reset() {
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fragment_depth_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  // The real color attachment outputs are only created on the host render
+  // target path, so clear them here - the fragment shader interlock path must
+  // see spv::NoResult and skip the end-of-shader copy. Canary 966d8f092.
+  std::fill(output_fragment_data_.begin(), output_fragment_data_.end(), spv::NoResult);
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -497,6 +501,12 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_vfetch_address_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
+    // Exclusive end of the vfetch_full buffer, kept alongside the address so
+    // vfetch_mini can clamp out-of-bounds words to 0 instead of returning
+    // whatever unrelated guest data sits in shared memory (Canary 9e9d3cdd3).
+    var_main_vfetch_bound_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
+                                 "xe_var_vfetch_bound", const_int_0_);
     var_main_tfetch_lod_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_tfetch_lod", const_float_0_);
@@ -795,6 +805,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         builder_->createStore(const_int4_0_, var_main_loop_address_);
         builder_->createStore(const_float_0_, var_main_previous_scalar_);
         builder_->createStore(const_int_0_, var_main_vfetch_address_);
+        // Reset alongside the address - the vertex fetch bound is per-invocation
+        // state too (Canary 9e9d3cdd3).
+        builder_->createStore(const_int_0_, var_main_vfetch_bound_);
         builder_->createStore(const_float_0_, var_main_tfetch_lod_);
         builder_->createStore(const_float3_0_, var_main_tfetch_gradients_h_);
         builder_->createStore(const_float3_0_, var_main_tfetch_gradients_v_);
@@ -2960,9 +2973,13 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   if (!edram_fragment_shader_interlock_) {
-    // Framebuffer color attachment outputs.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
+    // Framebuffer color attachment outputs (host render target path only).
+    // These are the real Output variables. They are now write-only endpoints:
+    // the shader body works on the Function-scoped variables created in
+    // StartFragmentShaderInMain, and CompleteFragmentShaderInMain copies into
+    // these at the very end. Reading an Output variable - which the alpha test
+    // used to do here - is what Canary 966d8f092 removed.
+    std::fill(output_fragment_data_.begin(), output_fragment_data_.end(), spv::NoResult);
     if (!is_depth_only_fragment_shader_) {
       static const char* const kFragmentDataOutputNames[] = {
           "xe_out_fragment_data_0",
@@ -2977,7 +2994,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         spv::Id output_fragment_data_rt =
             builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput, type_float4_,
                                      kFragmentDataOutputNames[color_target_index]);
-        output_or_var_fragment_data_[color_target_index] = output_fragment_data_rt;
+        output_fragment_data_[color_target_index] = output_fragment_data_rt;
         builder_->addDecoration(output_fragment_data_rt, spv::DecorationLocation,
                                 int(color_target_index));
         // Make invariant as pixel shaders may be used for various precise
@@ -3028,36 +3045,51 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   }
 
   if (edram_fragment_shader_interlock_) {
-    // Initialize color output variables with fragment shader interlock.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
+    // Depth output variable with fragment shader interlock.
     var_main_fragment_depth_ = spv::NoResult;
-    var_main_fsi_color_written_ = spv::NoResult;
     if (current_shader().writes_depth()) {
       var_main_fragment_depth_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                    "xe_var_fragment_depth", const_float_0_);
     }
-    uint32_t color_targets_written = current_shader().writes_color_targets();
-    if (color_targets_written) {
-      static const char* const kFragmentDataVariableNames[] = {
-          "xe_var_fragment_data_0",
-          "xe_var_fragment_data_1",
-          "xe_var_fragment_data_2",
-          "xe_var_fragment_data_3",
-      };
-      uint32_t color_targets_remaining = color_targets_written;
-      uint32_t color_target_index;
-      while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
-        color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
-        output_or_var_fragment_data_[color_target_index] = builder_->createVariable(
-            spv::NoPrecision, spv::StorageClassFunction, type_float4_,
-            kFragmentDataVariableNames[color_target_index], const_float4_0_);
-      }
-      var_main_fsi_color_written_ =
-          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
-                                   "xe_var_fsi_color_written", const_uint_0_);
+  }
+
+  // Color variables are Function-scoped on BOTH paths now, not just with
+  // fragment shader interlock. On the host render target path the shader used
+  // to write the colors straight into the SPIR-V Output variables, which are
+  // write-only - so CompleteFragmentShaderInMain had to OpLoad the alpha back
+  // out of an Output variable to run the alpha test and alpha to coverage, and
+  // var_main_fsi_color_written_ did not exist there at all, so a draw that
+  // never wrote render target 0 was alpha-tested against the zero-initialized
+  // output instead of skipping the test. This is every alpha-tested and
+  // alpha-to-coverage draw on the default Vulkan path. Keep the colors in
+  // Function variables for the whole shader; CompleteFragmentShaderInMain
+  // publishes them into output_fragment_data_ at the end. Canary 966d8f092.
+  std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
+            spv::NoResult);
+  var_main_fsi_color_written_ = spv::NoResult;
+  uint32_t color_targets_written = current_shader().writes_color_targets();
+  if (color_targets_written && !is_depth_only_fragment_shader_) {
+    static const char* const kFragmentDataVariableNames[] = {
+        "xe_var_fragment_data_0",
+        "xe_var_fragment_data_1",
+        "xe_var_fragment_data_2",
+        "xe_var_fragment_data_3",
+    };
+    uint32_t color_targets_remaining = color_targets_written;
+    uint32_t color_target_index;
+    while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
+      color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
+      output_or_var_fragment_data_[color_target_index] = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+          kFragmentDataVariableNames[color_target_index], const_float4_0_);
     }
+    // Color write tracking, used by both paths now to skip the alpha test and
+    // alpha to coverage when render target 0 was not written on the taken
+    // execution path.
+    var_main_fsi_color_written_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                 "xe_var_fsi_color_written", const_uint_0_);
   }
 
   if (edram_fragment_shader_interlock_ && FSI_IsDepthStencilEarly()) {
@@ -3320,13 +3352,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   }
 
   if (!edram_fragment_shader_interlock_) {
-    // Initialize the colors for safety.
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      spv::Id output_fragment_data_rt = output_or_var_fragment_data_[i];
-      if (output_fragment_data_rt != spv::NoResult) {
-        builder_->createStore(const_float4_0_, output_fragment_data_rt);
-      }
-    }
+    // The color variables are Function-scoped now and are created with a zero
+    // initializer, and CompleteFragmentShaderInMain stores into every Output
+    // variable it created, so the explicit "initialize the colors for safety"
+    // stores that used to target the Output variables here are redundant.
+    // Canary 966d8f092. The depth determinism store below is ours and stays.
     if (output_fragment_depth_ != spv::NoResult) {
       // Keep output deterministic if oDepth is not written on a control flow
       // path.
@@ -3671,8 +3701,13 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
       assert_not_zero(used_write_mask);
       assert_true(current_shader().writes_color_target(result.storage_index));
       target_pointer = output_or_var_fragment_data_[result.storage_index];
-      if (edram_fragment_shader_interlock_) {
-        assert_true(var_main_fsi_color_written_ != spv::NoResult);
+      // Record which render targets were written on the taken execution path on
+      // BOTH paths now, not only with fragment shader interlock - the host
+      // render target path needs this to skip the alpha test and alpha to
+      // coverage when render target 0 was never written. The variable exists
+      // exactly when the shader writes any color target, so its presence is the
+      // condition. Canary 966d8f092.
+      if (var_main_fsi_color_written_ != spv::NoResult) {
         builder_->createStore(
             builder_->createBinOp(
                 spv::OpBitwiseOr, type_uint_,
@@ -4045,7 +4080,14 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(3);
   uint_vector_temp_.push_back(2);
   value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in64,
+      // Before SPIR-V 1.4, an OpSelect with a vector result type requires a
+      // vector-of-bool condition; a scalar one is malformed SPIR-V, not just a
+      // validator complaint. We still emit Spv_1_0 when the device lacks 1.4
+      // (see the version selection in StartTranslation), so on those drivers
+      // this select is undefined - it may swap the wrong dwords or fail to
+      // compile the module outright. Canary 6de637b79.
+      spv::OpSelect, type_uint4_,
+      builder_->smearScalar(spv::NoPrecision, is_8in64, type_bool4_),
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 
@@ -4058,7 +4100,12 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(1);
   uint_vector_temp_.push_back(0);
   value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in128,
+      // Same pre-1.4 rule as the 8-in-64 select above: a vector-result
+      // OpSelect needs a vector-of-bool condition, and we still emit Spv_1_0
+      // on devices without 1.4, where a scalar condition is malformed SPIR-V.
+      // Canary 6de637b79.
+      spv::OpSelect, type_uint4_,
+      builder_->smearScalar(spv::NoPrecision, is_8in128, type_bool4_),
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 

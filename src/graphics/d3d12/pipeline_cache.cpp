@@ -899,6 +899,32 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
+
+    // D3D12 fixed-function blending ignores the blend factors for MIN/MAX, but
+    // the Xbox 360 applies them before the min/max - a MIN/MAX draw with a
+    // kSrcAlpha source factor currently blends as if the factor were ONE. The
+    // destination is not readable in this path, so only the source side can be
+    // emulated, and only when the destination factor is ONE (otherwise the
+    // destination term would need the factor applied too). RT0 only.
+    // Canary 067641668.
+    modification.pixel.rt0_blend_rgb_factor_for_premult = xenos::BlendFactor::kOne;
+    modification.pixel.rt0_blend_a_factor_for_premult = xenos::BlendFactor::kOne;
+    if (shader.writes_color_target(0)) {
+      auto blend_control =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+      if ((blend_control.color_comb_fcn == xenos::BlendOp::kMin ||
+           blend_control.color_comb_fcn == xenos::BlendOp::kMax) &&
+          blend_control.color_srcblend == xenos::BlendFactor::kSrcAlpha &&
+          blend_control.color_destblend == xenos::BlendFactor::kOne) {
+        modification.pixel.rt0_blend_rgb_factor_for_premult = xenos::BlendFactor::kSrcAlpha;
+      }
+      if ((blend_control.alpha_comb_fcn == xenos::BlendOp::kMin ||
+           blend_control.alpha_comb_fcn == xenos::BlendOp::kMax) &&
+          blend_control.alpha_srcblend == xenos::BlendFactor::kSrcAlpha &&
+          blend_control.alpha_destblend == xenos::BlendFactor::kOne) {
+        modification.pixel.rt0_blend_a_factor_for_premult = xenos::BlendFactor::kSrcAlpha;
+      }
+    }
   }
 
   return modification;

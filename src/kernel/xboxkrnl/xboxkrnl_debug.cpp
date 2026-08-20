@@ -143,12 +143,51 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
   rex::debug::Break();
 }
 
+// Adopted from Xenia Canary b0a387c6e ("[XboxKrnl] Don't crash the host on
+// guest trap").
+//
+// What broke today: a guest bugcheck took the host process with it. The STOP
+// line went out at DEBUG level, so a release log usually never recorded the
+// stop code at all; then rex::debug::Break() -- an unconditional
+// __debugbreak(), see src/core/dbg_win.cpp:23 -- raised EXCEPTION_BREAKPOINT
+// with nothing to catch it, and assert_always() compiles to nothing under
+// NDEBUG (include/rex/assert.h:30 and :56). A bugcheck is the guest naming a
+// kernel export we got wrong, and we were destroying that evidence in the act
+// of receiving it. So: log at error level so the code and all four parameters
+// survive into a shipped log, break only when a debugger is actually there to
+// catch it, and park the faulting guest thread instead of killing the runtime.
+//
+// Canary also raises an ImGui dialog from here; the kernel layer in this tree
+// has no window or drawer to reach for, so that half is deliberately not
+// ported. The unconditional rex::debug::Break() in RtlRaiseException_entry
+// above is a separate problem -- Canary fixed that one in a different change
+// and it is not part of this adoption.
 void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
-  REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
+  REXKRNL_ERROR("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
                 param3, param4);
   fflush(stdout);
-  rex::debug::Break();
-  assert_always();
+
+  if (rex::debug::IsDebuggerAttached()) {
+    rex::debug::Break();
+  }
+
+  // KeBugCheckEx does not return on hardware. Suspending the calling guest
+  // thread is the closest we can get without tearing the host down: the log is
+  // flushed, the other threads and the memory image stay alive to be inspected.
+  // If something later resumes the thread we fall out and return to the guest,
+  // which is a lie, but a quieter one than a dead process.
+  auto* current_thread = XThread::GetCurrentThread();
+  if (!current_thread) {
+    REXKRNL_ERROR("KeBugCheckEx raised with no current guest thread; returning to caller");
+    return;
+  }
+#if REX_PLATFORM_LINUX
+  // Host suspend-of-self is not usable on Linux; XThread carries a self-suspend
+  // path for exactly this case (see NtSuspendThread in xboxkrnl_threading.cpp).
+  current_thread->SelfSuspend();
+#else
+  current_thread->Suspend(nullptr);
+#endif
 }
 
 void KeBugCheck_entry(u32 code) {

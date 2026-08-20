@@ -1058,7 +1058,19 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
+// Canary declares this kStub too -- xenia-canary src/xenia/kernel/xam/xam_net.cc:1138-1142,
+// introduced already stubbed in d0175ddf2 and only ever arity-fixed since
+// (cdd3f161f). There is no implementation to adopt and we are not inventing one:
+// neither tree keeps an XNKID/XNKEY registration table, so there is nothing to
+// unregister from. What we adopt is Canary's `return 0;`.
+//
+// What breaks today: REX_EXPORT_STUB expands to REX_STUB (include/rex/hook.h:52-56),
+// which only logs -- it never writes ctx.r3. r3 is both argument 0 in
+// (include/rex/ppc/function.h:110) and the return value out (function.h:176), so
+// the guest reads back the `caller` argument it passed us, XNCALLER_TITLE = 0x1
+// for a title. XNet's contract is 0 = success, nonzero = WSA error, so we report
+// a failure on a session-teardown call that cannot fail.
+REX_EXPORT_STUB_RETURN(__imp__NetDll_XNetUnregisterKey, 0);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);

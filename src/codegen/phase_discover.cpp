@@ -113,13 +113,30 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   // Pass pdataSize so forward branches within function extent are correctly identified.
   // Configured chunks are address-taken entries inside their parent, not hard local
   // branch boundaries for that parent.
-  auto effectiveKnownFunctions = knownFunctions;
+  // This used to be `auto effectiveKnownFunctions = knownFunctions;` -- a full deep copy
+  // of the known-function set, taken ONCE PER DISCOVERED FUNCTION. On forza_horizon that
+  // set holds ~65,000 addresses and discovery calls this ~65,000 times, so the copy alone
+  // is on the order of four billion unordered_set node allocations, against a measured
+  // budget of ~1.9 ms per call and 124.6 s for the whole phase.
+  //
+  // The copy existed only so the erase() loops below could subtract configured chunks.
+  // Those loops are driven entirely by chunksByParent, which is populated only from
+  // functions.toml entries carrying `parent`. Across the whole 30-title fleet there is
+  // exactly ONE such entry (dragon_ball_z_burst_limit); forza_horizon has none. So in the
+  // overwhelming majority of calls both loops iterate an empty map and the copy is
+  // discarded bit-identical to its source.
+  //
+  // Subtract with a small overlay instead of copying: build the excluded set (almost
+  // always empty), and answer membership as "in base AND NOT excluded". Downstream this
+  // set is only ever consulted through contains(), so the two formulations are exactly
+  // equivalent -- byte-identical output by construction, and no threading involved.
+  std::unordered_set<uint32_t> excludedChunks;
   const uint32_t chunkParent = graph.chunkParent(funcAddr);
   const uint32_t chunkLookupParent = chunkParent != 0 ? chunkParent : funcAddr;
   auto chunkIt = ctx.analysisState().chunksByParent.find(chunkLookupParent);
   if (chunkIt != ctx.analysisState().chunksByParent.end()) {
     for (uint32_t chunkAddr : chunkIt->second) {
-      effectiveKnownFunctions.erase(chunkAddr);
+      excludedChunks.insert(chunkAddr);
     }
   }
   if (pdataSize != 0) {
@@ -127,11 +144,22 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
     for (const auto& [_, chunkAddrs] : ctx.analysisState().chunksByParent) {
       for (uint32_t chunkAddr : chunkAddrs) {
         if (chunkAddr >= funcAddr && chunkAddr < funcEnd) {
-          effectiveKnownFunctions.erase(chunkAddr);
+          excludedChunks.insert(chunkAddr);
         }
       }
     }
   }
+  // Only materialise a copy when something actually has to be removed. Empty overlay --
+  // the fleet-wide common case -- hands discoverBlocks the shared set by reference.
+  std::unordered_set<uint32_t> effectiveKnownFunctionsStorage;
+  if (!excludedChunks.empty()) {
+    effectiveKnownFunctionsStorage = knownFunctions;
+    for (uint32_t chunkAddr : excludedChunks) {
+      effectiveKnownFunctionsStorage.erase(chunkAddr);
+    }
+  }
+  const std::unordered_set<uint32_t>& effectiveKnownFunctions =
+      excludedChunks.empty() ? knownFunctions : effectiveKnownFunctionsStorage;
   // Explicit landing seeds: rexauto lists the exact addresses of jump-table landings
   // that the SDK's heuristic detectJumpTable under-recovered (derived from the real
   // "use of undeclared label 'loc_T'" build errors -- a dangling goto is, by

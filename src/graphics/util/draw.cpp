@@ -106,6 +106,17 @@ void GetPreferredFacePolygonOffset(const RegisterFile& regs, bool primitive_poly
     if (pa_su_sc_mode_cntl.poly_offset_front_enable && !pa_su_sc_mode_cntl.cull_front) {
       scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
       offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+      // Quantize the slope scale to one significant digit. This value reaches
+      // the D3D12 pipeline cache as PipelineDescription::depth_bias_slope_scaled
+      // (d3d12/pipeline_cache.cpp:1434), a raw float inside a struct that is
+      // keyed by a bytewise XXH3 of the whole description - so a title that
+      // sweeps this register continuously mints a new PSO for every distinct
+      // float, i.e. a pipeline cache miss plus a mid-frame PSO creation on every
+      // polygonal draw, and the objects are never freed. Rounding collapses the
+      // key space; the precision given up is far below what the hardware polygon
+      // offset unit resolves. Only the front scale is quantized, matching
+      // Canary 8c44649f0.
+      scale = rex::round_to_nearest_order_of_magnitude(scale);
     }
     if (pa_su_sc_mode_cntl.poly_offset_back_enable && !pa_su_sc_mode_cntl.cull_back && !scale &&
         !offset) {
@@ -905,10 +916,19 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     y1 = y0 + int32_t(xenos::kMaxResolveSize);
   }
 
-  assert_true(x0 < x1 && y0 < y1);
+  // An empty or inverted region after clipping (entirely outside EDRAM bounds due to a
+  // window offset, typically) is a NO-OP, not an error. Returning false here makes the
+  // caller fail the draw, and the two errors come out one-for-one: forza_horizon logs
+  // 20,256 "Resolve region is empty" and 20,257 "Failed in backend" in a single run --
+  // twenty thousand draws killed by a resolve the title never needed. Both call sites
+  // (d3d12 render_target_cache.cpp:1189, vulkan :1422) already skip on a zero extent, so
+  // reporting the empty region THROUGH that path is the correct lowering.
+  // Adopted by content from xenia-canary canary_experimental, whose own comment names
+  // Forza Horizon 1/2 as the titles that do this constantly with no visible impact.
   if (x0 >= x1 || y0 >= y1) {
-    REXGPU_ERROR("Resolve region is empty");
-    return false;
+    info_out.coordinate_info.width_div_8 = 0;
+    info_out.height_div_8 = 0;
+    return true;
   }
 
   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;

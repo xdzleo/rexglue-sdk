@@ -576,7 +576,8 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
   bool scalar_src_absolute = false;
   switch (scalar_opcode_info.operand_count) {
     case 1: {
-      // r#/c#.w or r#/c#.wx.
+      // r#/c#.w, or r#/c#.wx -- unless the co-issued vector op takes three sources,
+      // in which case r#/c#.wz.
       const float* scalar_src_ptr;
       uint32_t scalar_src_register = instr.src_reg(3);
       std::array<float, 4> scalar_src_float_constant;
@@ -595,8 +596,17 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
       uint32_t scalar_src_swizzle = instr.src_swizzle(3);
       scalar_operand_component_count = scalar_opcode_info.single_operand_is_two_component ? 2 : 1;
       for (uint32_t i = 0; i < scalar_operand_component_count; ++i) {
+        // `a` is always W, but `b` is Z rather than X when the co-issued vector op takes
+        // three sources (mad, cndeq, cndge, cndgt, dp2add) -- source 3 is shared between the
+        // two halves and the vector half has already claimed it. The old (3 + i) & 3 always
+        // said X, so the interpreter read a different component than the hardware and than
+        // our own translated shaders do, for adds/muls/muls_prev2/maxs/mins/subs/maxas/maxasf
+        // paired with mad or a cnd* -- silently wrong values in every trace-driven check.
+        // Adopted by content from xenia-canary 92ada8ebc.
+        uint32_t source_component =
+            i == 0 ? 3 : (vector_opcode_info.GetOperandCount() == 3 ? 2 : 0);
         scalar_operands[i] = scalar_src_ptr[ucode::AluInstruction::GetSwizzledComponentIndex(
-            scalar_src_swizzle, (3 + i) & 3)];
+            scalar_src_swizzle, source_component)];
       }
     } break;
     case 2: {

@@ -425,7 +425,51 @@ REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
 REX_EXPORT_STUB(__imp__XamGetLocaleDateFormat);
 REX_EXPORT_STUB(__imp__XamGetLocaleTimeFormat);
 REX_EXPORT_STUB(__imp__XamGetOnlineCountryFeatures);
-REX_EXPORT_STUB(__imp__XamGetOnlineLanguageAndCountry);
+// XamGetOnlineLanguageAndCountry(xuid, out_language, out_country) writes one
+// byte into each non-null out-pointer and returns nothing. As a REX_EXPORT_STUB
+// it wrote neither, so the guest read back whatever was already sitting in those
+// two bytes and then indexed a locale table with it -- a lie the title cannot
+// detect, not a benign "unimplemented" return.
+//
+// Ported from Xenia Canary 072ef7eff ("[XAM] Implemented
+// XamGetOnlineLanguageAndCountry"), minus its per-user profile lookup: we have
+// no user profiles, so both bytes come from the same cvars that back
+// xeXamGetLocaleEx above and XCONFIG_USER_COUNTRY / XCONFIG_USER_LANGUAGE in
+// src/kernel/xboxkrnl/xboxkrnl_xconfig.cpp.
+//
+// Canary writes the plain country/language ids straight into the "online"
+// buffers instead of converting, and that is exact for every value this tree can
+// hold: xeXamGetCountryFromOnlineCountry above is the identity over 0..110 (only
+// the two table holes, 17 and 94, differ), and the language and online-language
+// tables agree over 1..12, which is the range the settings overlay clamps
+// user_language to.
+//
+// user_language is defined in xam_user.cpp and only declared in
+// <rex/system/flags.h>, which this TU does not include -- declare the accessor
+// here rather than drag the header in. user_country is defined at the top of
+// this file.
+REXCVAR_DECLARE(uint32_t, user_language);
+
+namespace rex::kernel::xam {
+
+void XamGetOnlineLanguageAndCountry_entry(u64 xuid, mapped_u8 language_result_buffer,
+                                          mapped_u8 country_result_buffer) {
+  // No per-user profiles yet -- every xuid gets the console-wide setting.
+  (void)xuid;
+
+  if (country_result_buffer) {
+    *country_result_buffer = static_cast<uint8_t>(REXCVAR_GET(user_country));
+  }
+
+  if (language_result_buffer) {
+    *language_result_buffer = static_cast<uint8_t>(REXCVAR_GET(user_language));
+  }
+}
+
+}  // namespace rex::kernel::xam
+
+REX_EXPORT(__imp__XamGetOnlineLanguageAndCountry,
+           rex::kernel::xam::XamGetOnlineLanguageAndCountry_entry)
 REX_EXPORT_STUB(__imp__XamGetStoreFront);
 REX_EXPORT_STUB(__imp__XamUniSortCmpString);
 REX_EXPORT_STUB(__imp__XamValidateCountry);

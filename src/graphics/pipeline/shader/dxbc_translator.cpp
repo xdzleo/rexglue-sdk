@@ -2647,7 +2647,13 @@ void DxbcShaderTranslator::WriteInputSignature() {
     // shading.
     size_t sample_index_position = SIZE_MAX;
     if (current_shader().memexport_eM_written() && IsSampleRate()) {
-      size_t sample_index_position = shader_object_.size();
+      // Assign, do not redeclare. A shadowing declaration here left the outer
+      // sample_index_position at SIZE_MAX, so the `if (sample_index_position !=
+      // SIZE_MAX)` block below never ran: the parameter slot was reserved and
+      // parameter_count was incremented, but the "SV_SampleIndex" semantic name
+      // was never appended, emitting a malformed DXBC input signature.
+      // Backported from xenia-canary f2554eb74.
+      sample_index_position = shader_object_.size();
       shader_object_.resize(shader_object_.size() + kParameterDwords);
       ++parameter_count;
       {

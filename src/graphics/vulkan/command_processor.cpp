@@ -933,10 +933,13 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
       return true;
     }
     int32_t fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+    // Either word alone is enough - not every D3D version stamps both halves of the pair before
+    // the END packet. Requiring both (&&) made us miss the END, so the fake count was never
+    // written back and the guest read zero passed samples forever. Canary 8a49c0380.
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -967,10 +970,13 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     if (fake_sample_count < 0) {
       return true;
     }
+    // Either word alone is enough - see the END detection below. This has to stay in step with
+    // it, or the fallback would refuse to write the fake count for the very packet the caller
+    // already classified as an END. Canary 8a49c0380.
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -979,10 +985,16 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return true;
   };
 
+  // Either word alone is enough - not every D3D version stamps both halves of the pair before the
+  // END packet. Requiring both (&&) hurts more here than in the fake-count fallback: a missed END
+  // is read as a second BEGIN, BeginGuestOcclusionQuery then takes its "begin while another query
+  // is active" path, and that calls DisableHostOcclusionQueries() - one dropped sentinel turns
+  // host occlusion queries off for the rest of the run. Canary 8a49c0380 (culling flicker in
+  // 555307D5). Mirrors the D3D12 gate.
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -7168,6 +7180,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     rex::perf::ScopedCounterTimer end_frame_timer(rex::perf::CounterId::kCpuD3D12EndFrameUs);
 
     texture_cache_->EndFrame();
+    // Same frame-close wiring as the D3D12 backend; see the comment there.
+    rex::perf::ResetFrameCounters();
+    rex::perf::WriteCsvFrame();
 
     primitive_processor_->EndFrame();
   }

@@ -369,8 +369,19 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_NO_SUCH_USER;
   }
 
+  // XPROFILE_GAMERCARD_AVATAR_INFO_1 -- SettingKey(BINARY, kMaxUserDataSize=1000,
+  // 0x44). Writing it has to raise a second notification, so note it here. The
+  // check sits deliberately ahead of the UNSET skip below: the title asked to
+  // write the avatar setting whether or not the payload type is one we store.
+  constexpr uint32_t kXProfileGamercardAvatarInfo1 = 0x63E80044;
+  bool was_avatar_setting_changed = false;
+
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
+
+    if (static_cast<uint32_t>(setting.setting_id) == kXProfileGamercardAvatarInfo1) {
+      was_avatar_setting_changed = true;
+    }
 
     auto setting_type = static_cast<UserProfile::Setting::Type>(setting.data.type);
     if (setting_type == UserProfile::Setting::Type::UNSET) {
@@ -409,6 +420,21 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
         REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
       } break;
     };
+  }
+
+  // The write is only half the contract. Today we store the settings and return
+  // success without ever telling anyone, so a title that writes a setting and
+  // then waits on SystemProfileSettingChanged before advancing waits forever --
+  // the same never-advances shape we see on the XamMediaVerification* poll.
+  // Raised before the overlapped completes, matching Canary 78d700af4, where the
+  // broadcast lives inside the deferred run() that precedes completion.
+  // user_index is 0 here (the guard above rejects everything else); the bit form
+  // is kept so this stays correct if more users are ever supported.
+  const uint32_t user_index_bit = (1u << user_index) & 0xF;
+  REX_KERNEL_STATE()->BroadcastNotification(kXNotificationSystemProfileSettingChanged,
+                                            user_index_bit);
+  if (was_avatar_setting_changed) {
+    REX_KERNEL_STATE()->BroadcastNotification(kXNotificationSystemAvatarChanged, user_index_bit);
   }
 
   if (overlapped) {
@@ -588,16 +614,29 @@ class XStaticAchievementEnumerator : public XEnumerator {
     uint32_t flags;
   };
 
+  // Pagination is applied by seeding this enumerator's own cursor, not by
+  // pre-dropping the source range: dropping at fill time makes the cursor and
+  // the caller's offset disagree from the second page onward. Canary 603355ae5.
+  // (Initializer order follows our member declaration order below, not Canary's.)
   XStaticAchievementEnumerator(KernelState* kernel_state, size_t items_per_enumerate,
-                               uint32_t flags)
+                               size_t enumeration_offset, uint32_t flags)
       : XEnumerator(kernel_state, items_per_enumerate,
                     sizeof(X_ACHIEVEMENT_DETAILS) +
                         (!!(flags & 7) ? X_ACHIEVEMENT_DETAILS::kStringBufferSize : 0)),
-        flags_(flags) {}
+        flags_(flags),
+        current_item_(enumeration_offset) {}
 
   void AppendItem(AchievementDetails item) { items_.push_back(std::move(item)); }
 
   uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
+    // current_item_ now starts at the caller's offset, which the guest chooses,
+    // so it can legitimately sit past the end of items_. Bail before the
+    // subtraction below -- unsigned, it would wrap to a huge count and then walk
+    // off the vector. Canary 603355ae5 does not guard this; we do.
+    if (current_item_ >= items_.size()) {
+      return X_ERROR_NO_MORE_FILES;
+    }
+
     size_t count = std::min(items_.size() - current_item_, items_per_enumerate());
     if (!count) {
       return X_ERROR_NO_MORE_FILES;
@@ -676,11 +715,16 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
   }
 
   if (buffer_size_ptr) {
-    *buffer_size_ptr = static_cast<uint32_t>(entry_size) * count;
+    // Multiply in size_t, then narrow -- narrowing entry_size first threw the
+    // high bits away before the product was even formed. Canary 603355ae5.
+    *buffer_size_ptr = static_cast<uint32_t>(entry_size * count);
   }
 
+  // offset was accepted and then never referenced again: a title paging
+  // achievements (offset=0,10,20...) got page one back every time. Hand it to
+  // the enumerator so its cursor starts where the caller asked. Canary 603355ae5.
   auto e = object_ref<XStaticAchievementEnumerator>(
-      new XStaticAchievementEnumerator(REX_KERNEL_STATE(), count, flags));
+      new XStaticAchievementEnumerator(REX_KERNEL_STATE(), count, offset, flags));
   auto result = e->Initialize(user_index, 0xFB, 0xB000A, 0xB000B, 0);
   if (XFAILED(result)) {
     return result;

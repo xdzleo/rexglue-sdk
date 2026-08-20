@@ -20,6 +20,18 @@ namespace rex::system {
 
 typedef uint32_t XNotificationID;
 
+// Notification IDs the kernel broadcasts. We had none of these: every
+// BroadcastNotification call site in the tree passed a bare literal, which made
+// them unreadable and made porting any Canary code that broadcasts by name a
+// hand-translation exercise. Only the IDs we actually raise are listed; the
+// full table lives in Canary's src/xenia/xbox.h if more are ever needed.
+// Values from Canary 78d700af4 (src/xenia/xbox.h:198, 215, 224).
+enum : XNotificationID {
+  kXNotificationSystemUI = 0x00000009,
+  kXNotificationSystemProfileSettingChanged = 0x0000000E,
+  kXNotificationSystemAvatarChanged = 0x00040017,
+};
+
 enum class XLanguage : uint32_t {
   kInvalid = 0,
   kEnglish = 1,

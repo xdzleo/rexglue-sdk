@@ -262,7 +262,43 @@ REX_EXPORT_STUB(__imp__ObInsertObject);
 REX_EXPORT_STUB(__imp__ObIsTitleObject);
 REX_EXPORT_STUB(__imp__ObLookupAnyThreadByThreadId);
 REX_EXPORT_STUB(__imp__ObMakeTemporaryObject);
-REX_EXPORT_STUB(__imp__ObReferenceObject);
+// ObReferenceObject was a bare REX_EXPORT_STUB here. REX_STUB (include/rex/hook.h:52-57)
+// only logs -- it never touches ctx.r3 and has no side effect -- so the retain half of the
+// guest's paired ObReferenceObject(ptr) / ObDereferenceObject(ptr) sequence did nothing while
+// ObDereferenceObject_entry above really does ReleaseHandle(). Every pair therefore netted -1
+// on handle_ref_count, and object_table.cpp:160-176 tears the handle out of the table the
+// moment that count reaches zero, so an object the guest still holds a handle to dies early
+// and every later NtWaitForSingleObject / NtClose / ObReferenceObjectByHandle on it returns
+// X_STATUS_INVALID_HANDLE.
+// Ported from Xenia Canary a63f424c0a3ec518b08215353883953ce9a644f4 (chrispy, 2022-12-04),
+// src/xenia/kernel/xboxkrnl/xboxkrnl_ob.cc:335-349. Deliberate difference: Canary's body is
+// missing the 0xDEADF00D dummy guard that its own comment claims to perform; we keep the
+// guard so this mirrors ObDereferenceObject_entry above exactly.
+namespace rex::kernel::xboxkrnl {
+using namespace rex::system;
+
+u32 ObReferenceObject_entry(u32 native_ptr) {
+  REXKRNL_IMPORT_TRACE("ObReferenceObject", "ptr={:#x}", (uint32_t)native_ptr);
+  // Check if a dummy value from ObReferenceObjectByHandle.
+  if (native_ptr == 0xDEADF00D) {
+    return 0;
+  }
+
+  auto object = XObject::GetNativeObject<XObject>(
+      REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(native_ptr));
+  if (object) {
+    object->RetainHandle();
+  } else if (native_ptr) {
+    REXKRNL_WARN("Unregistered guest object provided to ObReferenceObject {:08X}",
+                 (uint32_t)native_ptr);
+  }
+
+  return 0;
+}
+
+}  // namespace rex::kernel::xboxkrnl
+
+REX_EXPORT(__imp__ObReferenceObject, rex::kernel::xboxkrnl::ObReferenceObject_entry)
 REX_EXPORT_STUB(__imp__ObTranslateSymbolicLink);
 REX_EXPORT_STUB(__imp__NtCreateDirectoryObject);
 REX_EXPORT_STUB(__imp__NtCreateSymbolicLinkObject);

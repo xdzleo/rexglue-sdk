@@ -206,7 +206,18 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
   return 0;
 }
 
-u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
+// The second argument is the flat 12-byte XMA_LOOP_DATA the guest builds
+// itself, not a context image. We were typing it as XMA_CONTEXT_DATA -- the
+// 64-byte hardware register struct from rex/audio/xma/context.h -- so every
+// field came out of the wrong byte: loop_start was read from DWORD3 (+12) and
+// loop_end from DWORD4 (+16) of an object the guest only allocated 12 bytes
+// for, which is both garbage loop points and an 8-byte over-read past the
+// guest allocation, while loop_count came out of DWORD0's
+// input_buffer_0_packet_count bits. Any title driving hardware XMA looping got
+// nonsense loop points. XMA_LOOP_DATA is declared above and was until now only
+// reachable through XMA_CONTEXT_INIT.
+// Canary e8263d367 "[XboxKrnl/Audio] Corrected XMASetLoopData's pointer type."
+u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_LOOP_DATA> loop_data) {
   // NULL guest context = the title's own error path (Superman Returns holds
   // NULL XMA contexts ~67s in); dereferencing it host-side was a hard AV.
   // Real hardware fails these calls gracefully -- answer benign no-op.

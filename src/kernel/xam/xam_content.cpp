@@ -547,10 +547,24 @@ REX_EXPORT_STUB(__imp__XamContentGetOnlineCreator);
 REX_EXPORT_STUB(__imp__XamContentInstall);
 REX_EXPORT_STUB(__imp__XamContentInstallInternal);
 REX_EXPORT_STUB(__imp__XamContentIsGameInstalledToHDD);
-REX_EXPORT_STUB(__imp__XamContentLaunchImage);
-REX_EXPORT_STUB(__imp__XamContentLaunchImageFromFileInternal);
-REX_EXPORT_STUB(__imp__XamContentLaunchImageInternal);
-REX_EXPORT_STUB(__imp__XamContentLaunchImageInternalEx);
+// None of these resolve anything, and REX_STUB never writes ctx.r3
+// (include/rex/hook.h:52-56), so each was returning argument 0 as its status
+// word: XamContentLaunchImage(user_index, ...) reported X_ERROR_SUCCESS for
+// player one and left the title waiting on a transition that never comes, while
+// the Internal variants returned the guest content_data_ptr as an X_RESULT.
+// Canary a292248be routes all four through xeXamContentLaunchImage, which
+// returns X_STATUS_NO_SUCH_FILE when the package cannot be resolved; its
+// success path (XamModule loader_data + TerminateTitle + a "please restart"
+// dialog) has no meaning in a single-title recompile, so only the failure
+// contract is taken. Our stub can never resolve a package, so that failure is
+// always the correct answer. Spelled as a literal because these registrations
+// sit outside namespace rex and X_STATUS_NO_SUCH_FILE expands to an unqualified
+// X_STATUS cast; 0xC000000F reads as failure both as an NTSTATUS and as a
+// nonzero X_RESULT. Canary a292248be.
+REX_EXPORT_STUB_RETURN(__imp__XamContentLaunchImage, 0xC000000F);
+REX_EXPORT_STUB_RETURN(__imp__XamContentLaunchImageFromFileInternal, 0xC000000F);
+REX_EXPORT_STUB_RETURN(__imp__XamContentLaunchImageInternal, 0xC000000F);
+REX_EXPORT_STUB_RETURN(__imp__XamContentLaunchImageInternalEx, 0xC000000F);
 REX_EXPORT_STUB(__imp__XamContentLockUnlockPackageHeaders);
 REX_EXPORT_STUB(__imp__XamContentMountInstalledGame);
 REX_EXPORT_STUB(__imp__XamContentMountPackage);

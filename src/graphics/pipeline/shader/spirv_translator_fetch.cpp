@@ -48,9 +48,17 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   uint32_t fetch_constant_word_0_index = instr.operands[1].storage_index << 1;
 
   spv::Id address;
+  // Exclusive end of the fetch buffer in dwords (base + size). Words at or past
+  // it must read as 0: the shared memory binding covers all of physical memory,
+  // so an out-of-bounds word otherwise loads whatever unrelated guest data sits
+  // there instead of the zeros the hardware clamps to, and an overallocated
+  // draw comes out as stray geometry instead of the degenerate primitives the
+  // title expects. Canary 9e9d3cdd3.
+  spv::Id fetch_end;
   if (instr.is_mini_fetch) {
-    // `base + index * stride` loaded by vfetch_full.
+    // `base + index * stride` and the end bound loaded by vfetch_full.
     address = builder_->createLoad(var_main_vfetch_address_, spv::NoPrecision);
+    fetch_end = builder_->createLoad(var_main_vfetch_bound_, spv::NoPrecision);
   } else {
     // Get the base address in dwords from the bits 2:31 of the first fetch
     // constant word.
@@ -73,6 +81,34 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
         spv::OpBitcast, type_int_,
         builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_0,
                               builder_->makeUintConstant(2)));
+    // `address` is still the plain base here, before the index is folded in -
+    // the exclusive end is base + size, the size in words being bits 2:25 of
+    // the second fetch constant word. Store it for the subsequent vfetch_mini,
+    // which reuses this fetch constant.
+    uint32_t fetch_constant_bound_word_index = fetch_constant_word_0_index + 1;
+    id_vector_temp_.clear();
+    // The only element of the fetch constant buffer.
+    id_vector_temp_.push_back(const_int_0_);
+    // Vector index.
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(int(fetch_constant_bound_word_index >> 2)));
+    // Component index.
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(int(fetch_constant_bound_word_index & 3)));
+    spv::Id fetch_constant_bound_word =
+        builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                         uniform_fetch_constants_, id_vector_temp_),
+                             spv::NoPrecision);
+    fetch_end = builder_->createBinOp(
+        spv::OpIAdd, type_int_, address,
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_,
+                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                      fetch_constant_bound_word, builder_->makeUintConstant(2)),
+                builder_->makeUintConstant((uint32_t(1) << 24) - 1))));
+    builder_->createStore(fetch_end, var_main_vfetch_bound_);
     if (instr.attributes.stride) {
       // Convert the index to an integer by flooring or by rounding to the
       // nearest (as floor(index + 0.5) because rounding to the nearest even
@@ -121,11 +157,15 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
                                            builder_->makeIntConstant(int(word_offset)));
     }
     word_composite_indices[word_index] = word_count;
-    // FIXME(Triang3l): Bound checking is not done here, but haven't encountered
-    // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
-    // P705), however, words (not full elements) out of glBufferData bounds
-    // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    // Words at or past the end of the fetch buffer read as 0, matching the
+    // hardware's bounds clamping (Canary 9e9d3cdd3). Unsigned comparison, so a
+    // guest index that wraps the dword address also lands out of bounds.
+    spv::Id loaded_word = LoadUint32FromSharedMemory(word_address);
+    spv::Id word_in_bounds =
+        builder_->createBinOp(spv::OpULessThan, type_bool_, word_address, fetch_end);
+    word_composite_constituents[word_count++] =
+        builder_->createTriOp(spv::OpSelect, type_uint_, word_in_bounds, loaded_word,
+                              const_uint_0_);
   }
   spv::Id words;
   if (word_count > 1) {
@@ -926,6 +966,44 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         } break;
       }
+      // Unnormalized coordinates address texels of the mip being sampled, not
+      // always the base level. Titles that lock the fetch constant to a single
+      // mip (MipMinLevel == MipMaxLevel) and address that mip's grid were
+      // getting the base level size as the denominator below, so every
+      // reduction after the first sampled at 1/2^mip of the intended position
+      // and read garbage - visible as visibility popping in the HZB reducers
+      // of 555308B6 and 5553080B. Substitute max(size >> mip, 1) when the mip
+      // is locked. Scoped to 2D unnormalized kTextureFetch; everything else
+      // keeps the base level denominator until there is a shared effective LOD
+      // model. This changes only the denominator.
+      // Ported from Xenia Canary 8486e97a0.
+      spv::Id selected_mip_level = spv::NoResult;
+      spv::Id selected_mip_locked = spv::NoResult;
+      bool selected_mip_grid_possible = instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+                                        instr.dimension == xenos::FetchOpDimension::k2D &&
+                                        instr.attributes.unnormalized_coordinates;
+      if (selected_mip_grid_possible) {
+        // Fetch constant word 4 has MipMinLevel in bits 2:5 and MipMaxLevel in
+        // bits 6:9.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 4) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 4) & 3)));
+        spv::Id fetch_constant_word_4 = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        selected_mip_level =
+            builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, fetch_constant_word_4,
+                                  builder_->makeUintConstant(2), builder_->makeUintConstant(4));
+        spv::Id mip_max_level =
+            builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, fetch_constant_word_4,
+                                  builder_->makeUintConstant(6), builder_->makeUintConstant(4));
+        selected_mip_locked = builder_->createBinOp(spv::OpIEqual, type_bool_, selected_mip_level,
+                                                    mip_max_level);
+      }
       {
         uint32_t size_remaining_components = size_needed_components;
         uint32_t size_component_index;
@@ -935,6 +1013,18 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // Fetch constants store size minus 1 - add 1.
           size_component_ref = builder_->createBinOp(spv::OpIAdd, type_uint_, size_component_ref,
                                                      builder_->makeUintConstant(1));
+          if (selected_mip_locked != spv::NoResult) {
+            // max(size >> mip, 1) for non-power-of-two textures. Resolution
+            // scaling stays unchanged.
+            spv::Id selected_mip_size = builder_->createBinBuiltinCall(
+                type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMax,
+                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, size_component_ref,
+                                      selected_mip_level),
+                builder_->makeUintConstant(1));
+            size_component_ref =
+                builder_->createTriOp(spv::OpSelect, type_uint_, selected_mip_locked,
+                                      selected_mip_size, size_component_ref);
+          }
           // Convert the size to float for multiplication or division.
           size_component_ref =
               builder_->createUnaryOp(spv::OpConvertUToF, type_float_, size_component_ref);
@@ -1168,6 +1258,18 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             z_stacked =
                 builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, z_stacked, z_offset);
           }
+          // Clamp the stacked-texture layer index to [0, z_size - 1]. A guest Z
+          // of Inf or NaN survives both the denormalize multiply and the offset
+          // add, and the array layer index is undefined for out-of-range values
+          // - the fetch then samples whatever layer the driver happens to land
+          // on, so the same draw renders differently per vendor and per driver
+          // revision. NClamp also folds NaN to the lower bound, which makes the
+          // degenerate case deterministic instead of merely quiet.
+          // Xenia Canary 2d5b41080.
+          z_stacked = builder_->createTriBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, z_stacked, const_float_0_,
+              builder_->createNoContractionBinOp(spv::OpFSub, type_float_, z_size,
+                                                 builder_->makeFloatConstant(1.0f)));
           builder_->createBranch(&block_dimension_merge);
           // Select one of the two.
           builder_->setBuildPoint(&block_dimension_merge);
@@ -2220,7 +2322,13 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
               builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, sign_result,
                                                  lerp_first),
               lerp_factor);
-          sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, sign_result,
+          // The inter-layer lerp base must be the first (lower-layer) sample:
+          // first + (second - first) * factor. With sign_result as the base,
+          // factor=0 returned layer N+1 instead of layer N, and factor=1
+          // returned 2*second - first, overshooting outside the two sampled
+          // layers - so every stacked-texture layer transition was wrong.
+          // Canary e519d59e4.
+          sign_result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, lerp_first,
                                                            lerp_difference);
         }
       }

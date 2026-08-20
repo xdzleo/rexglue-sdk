@@ -565,10 +565,86 @@ REX_EXPORT_STUB(__imp__XamLrcVerifyClientId);
 REX_EXPORT_STUB(__imp__XamMarkInternalAccountTrustedOnConsole);
 REX_EXPORT_STUB(__imp__XamMarketplaceAcquireFreeContent);
 REX_EXPORT_STUB(__imp__XamMediaVerificationClose);
-REX_EXPORT_STUB(__imp__XamMediaVerificationCreate);
-REX_EXPORT_STUB(__imp__XamMediaVerificationFailedBlocks);
+// Bare REX_EXPORT_STUB (include/rex/hook.h:76 -> REX_STUB at include/rex/hook.h:51-55)
+// never assigns ctx.r3, and r3 is simultaneously arg0 (creation_flags) and the return
+// register -- so today this hands the title back its own flags word as the status code,
+// and any non-zero creation_flags reads as a failing HRESULT. Canary returns
+// X_ERROR_SUCCESS unconditionally: xenia-canary src/xenia/kernel/xam/xam_media.cc:19-22,
+// sha 5a5fe97efbefebbb07a1f1bd58c0d588a324732a (Gliniak, 2024-10-09,
+// "[XAM] Added XamMediaVerification stubs"). Ordinal 0x9BB, export_table.inc:1586.
+// 0u, not X_ERROR_SUCCESS: that is a macro expanding through X_RESULT_FROM_WIN32, and
+// X_RESULT is unqualified inside it, so it does not compile outside namespace rex.
+REX_EXPORT_STUB_RETURN(__imp__XamMediaVerificationCreate, 0u);
 REX_EXPORT_STUB(__imp__XamMediaVerificationInject);
-REX_EXPORT_STUB(__imp__XamMediaVerificationVerify);
+
+// --- media verification ------------------------------------------------------------
+// Gears of War Judgment spins here forever: 1,882 hits in our fleet logs, a Verify +
+// FailedBlocks pair every ~600 ms, never advancing. The pair is a poll loop -- Verify
+// kicks the scan, then the title reads FailedBlocks until `complete` comes back set.
+// Both were REX_EXPORT_STUB, which writes nothing at all: the guest's structure is never
+// touched, so `complete` keeps whatever the title initialised it to (zero) and the poll
+// has no exit. There is nothing to verify on a recompiled build -- no disc, no blocks --
+// so reporting an immediately-finished, zero-failure scan is the truthful answer, not a
+// convenient lie.
+// Adopted by content from xenia-canary xam_media.cc (sha 5a5fe97ef), with one deliberate
+// improvement: Canary's Verify only EnqueueApc's the raw callback and leaves the
+// XAM_OVERLAPPED untouched, so a title that waits on the overlapped's EVENT rather than
+// the callback still hangs there. CompleteOverlappedImmediate does both -- it sets
+// result/extended_error/length, signals the event AND queues the completion routine.
+
+namespace rex {
+namespace kernel {
+namespace xam {
+
+// Guest-side layout, big-endian, exactly six words. `size` is how the title negotiates
+// the struct version, so the check is load-bearing: answering a size we do not recognise
+// would be writing past what the caller allocated.
+struct X_SECURITY_FAILURE_INFORMATION {
+  rex::be_u32 size;
+  rex::be_u32 failed_reads;
+  rex::be_u32 failed_hashes;
+  rex::be_u32 blocks_checked;
+  rex::be_u32 total_blocks;
+  rex::be_u32 complete;
+};
+
+u32 XamMediaVerificationVerify_entry(u32 flags, mapped_void overlapped_ptr, u32 callback) {
+  (void)flags;
+  (void)callback;
+  if (overlapped_ptr) {
+    // Signals the event and queues the completion routine, so both waiting styles wake.
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                    X_ERROR_SUCCESS);
+    return X_ERROR_IO_PENDING;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamMediaVerificationFailedBlocks_entry(
+    rex::MappedPtr<X_SECURITY_FAILURE_INFORMATION> failure_information) {
+  if (failure_information) {
+    if (failure_information->size != uint32_t(sizeof(X_SECURITY_FAILURE_INFORMATION))) {
+      // ERROR_NOT_ENOUGH_MEMORY (Win32 0x8), the code Canary returns here. Spelled out
+      // because our xtypes.h has no X_ERROR_NOT_ENOUGH_MEMORY, and substituting a
+      // constant we DO have would hand the guest a different code than it expects.
+      return X_RESULT_FROM_WIN32(0x00000008L);
+    }
+    failure_information->failed_reads = 0;
+    failure_information->failed_hashes = 0;
+    failure_information->blocks_checked = 0;
+    failure_information->total_blocks = 0;
+    failure_information->complete = 1;  // the field the poll loop is waiting on
+  }
+  return X_ERROR_SUCCESS;
+}
+
+}  // namespace xam
+}  // namespace kernel
+}  // namespace rex
+
+REX_EXPORT(__imp__XamMediaVerificationVerify, rex::kernel::xam::XamMediaVerificationVerify_entry)
+REX_EXPORT(__imp__XamMediaVerificationFailedBlocks,
+           rex::kernel::xam::XamMediaVerificationFailedBlocks_entry)
 REX_EXPORT_STUB(__imp__XamMoveFile);
 REX_EXPORT_STUB(__imp__XamNetworkStatusAddAddress);
 REX_EXPORT_STUB(__imp__XamNetworkStatusGetInformation);

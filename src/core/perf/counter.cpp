@@ -697,6 +697,19 @@ int64_t GetCounter(CounterId id) {
 }
 
 void ResetFrameCounters() {
+  // Open the log lazily on the first closed frame: the cvar is parsed after this
+  // translation unit's static init, so reading it at construction time would always see
+  // the empty default. Done once -- SetCsvLogPath resets g_csv_frame_count, so guarding
+  // on the handle would re-open and truncate every frame.
+  static bool csv_opened = false;
+  if (!csv_opened) {
+    csv_opened = true;
+    const std::string& csv_path = REXCVAR_GET(perf_log_csv);
+    if (!csv_path.empty()) {
+      SetCsvLogPath(csv_path);
+    }
+  }
+
   for (size_t i = 0; i < kNumCounters; ++i) {
     if (kIsGauge[i]) {
       // Gauges: snapshot the current value, don't zero

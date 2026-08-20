@@ -1352,8 +1352,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                  clear_render_targets[1], clear_transfers_[1])) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
-          clear_values[1] =
-              resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+          // RB_COLOR_CLEAR_LO holds the LOW 32 bits of a 64bpp packed clear value and
+          // RB_COLOR_CLEAR the high 32; at 32bpp RB_COLOR_CLEAR is the whole value and _LO is
+          // stale. We had the halves the wrong way round, so the host render target clear
+          // decomposition (which reads bits 0..31 as R/G and 32..63 as B/A) came out with RG and
+          // BA exchanged for k_16_16_16_16 and k_32_32_FLOAT. Canary 16e1eb8e2.
+          clear_values[1] = resolve_info.color_edram_info.format_is_64bpp
+                                ? resolve_info.rb_color_clear_lo |
+                                      (uint64_t(resolve_info.rb_color_clear) << 32)
+                                : resolve_info.rb_color_clear;
           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
                                            &clear_rectangle);
         }
@@ -1944,6 +1951,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   xenos::DepthRenderTargetFormat dest_depth_format =
       xenos::DepthRenderTargetFormat(key.dest_resource_format);
   bool dest_is_64bpp = dest_is_color && xenos::IsColorRenderTargetFormat64bpp(dest_color_format);
+  // k_8_8_8_8_GAMMA kept as R16G16B16A16_UNORM takes 64 bits of host storage
+  // but is still one 32bpp guest pixel - it does not pack two 32bpp samples the
+  // way a real 64bpp format does. So it needs the wide (four float components)
+  // output path while keeping 32bpp EDRAM addressing, which is why it gets its
+  // own flag instead of being folded into dest_is_64bpp: every coordinate
+  // transform below must keep using dest_is_64bpp. Canary 2912da02f.
+  bool dest_is_gamma_unorm16 =
+      dest_is_color && dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
+      gamma_render_target_as_unorm16_;
 
   xenos::ColorRenderTargetFormat source_color_format =
       xenos::ColorRenderTargetFormat(key.source_resource_format);
@@ -3041,7 +3057,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     a.OpMov(dxbc::Dest::OStencilRef(), dxbc::Src::R(1, dxbc::Src::kXXXX));
   }
 
-  if (dest_is_64bpp) {
+  // Gamma stored as R16G16B16A16_UNORM also takes the wide output path: the
+  // destination consumes four float components, not one packed 32-bit value,
+  // and the conversion it needs is source-gamma-to-linear rather than the 32bpp
+  // k_8_8_8_8 <-> gamma handling further down. Only the output packing moves
+  // here - dest_is_64bpp still drives every EDRAM coordinate transform above.
+  // Canary 2912da02f.
+  if (dest_is_64bpp || dest_is_gamma_unorm16) {
     // Handle construction of 64bpp color, either from two 32-bit samples in r0
     // and r1, or from one 64bpp sample in r1. Using r2.x as temporary when
     // needed.
@@ -3053,6 +3075,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
           // 8_8_8_8_GAMMA is represented by linear stored in
           // R16G16B16A16_UNORM.
+          // gamma -> gamma with both sides kept as R16G16B16A16_UNORM is
+          // already linear on both ends, and r1 holds the single loaded pixel
+          // (only one sample is loaded for a 32bpp-addressed destination), so
+          // pass it straight through. Re-encoding to PWL gamma and packing back
+          // to bytes here is what turned Halo Reach rock and plant textures
+          // black. Canary 2912da02f.
+          if (dest_is_gamma_unorm16) {
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+            break;
+          }
           for (uint32_t i = 0; i < 2; ++i) {
             for (uint32_t j = 0; j < 3; ++j) {
               DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, i, j, i, j, 2, 0, 2, 1);
@@ -3061,6 +3093,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         }
           [[fallthrough]];
         case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
+          // From a gamma destination's point of view a k_8_8_8_8 source holds
+          // gamma-encoded bytes, while the destination stores linear in
+          // R16G16B16A16_UNORM - decode, do not re-pack. Canary 2912da02f.
+          if (dest_is_gamma_unorm16) {
+            for (uint32_t j = 0; j < 3; ++j) {
+              DxbcShaderTranslator::PWLGammaToLinear(a, 1, j, 1, j, true, 2, 0, 2, 1);
+            }
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+            break;
+          }
           color_packed_in_r0x_and_r1x = true;
           for (uint32_t i = 0; i < 2; ++i) {
             a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
@@ -3175,6 +3217,62 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
         a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX));
         a.OpMov(dxbc::Dest::O(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX));
+      } else if (dest_is_gamma_unorm16) {
+        // For a gamma_unorm16 destination only r1.x holds a valid packed EDRAM
+        // dword - it is one guest 32bpp pixel even though the host target is
+        // 64bpp. Reinterpret it as k_8_8_8_8_GAMMA (four gamma-encoded bytes)
+        // and write linear floats for the R16G16B16A16_UNORM target.
+        //
+        // Store the midpoint of each gamma byte's linear range, not its exact
+        // lower edge. PreSaturatedLinearToPWLGamma truncates, so a value
+        // sitting on the lower boundary gets pushed below the threshold by
+        // UNORM16 quantization and the EDRAM dword comes back off by one in a
+        // byte - which corrupts any later cross-format reinterpretation of the
+        // same EDRAM range.
+        //
+        // For gamma byte B the midpoint linear value is:
+        //   Piece 0 (B < 64):        F = (B + 0.5) / 1023.0
+        //   Piece 1 (64 <= B < 96):  F = (B - 31.5) / 511.5
+        //   Piece 2 (96 <= B < 192): F = (B - 63.5) / 255.75
+        //   Piece 3 (B >= 192):      F = (B - 127.5) / 127.875
+        // evaluated as F = B * recip + offset. Canary 2912da02f.
+
+        // Extract the 4 bytes: r1.xyzw = [R, G, B, A] as uint.
+        a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8, 8, 8, 8), dxbc::Src::LU(0, 8, 16, 24),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX));
+        // Alpha: o0.w = float(A) / 255.0, no gamma conversion.
+        a.OpUToF(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
+        a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
+                dxbc::Src::LF(1.0f / 255.0f));
+        // RGB: per-channel midpoint decode, r0.xy holding (recip, offset) and
+        // r2.x as the comparison temporary.
+        for (uint32_t j = 0; j < 3; ++j) {
+          // Default to piece 0.
+          a.OpMov(dxbc::Dest::R(0, 0b0001), dxbc::Src::LF(1.0f / 1023.0f));
+          a.OpMov(dxbc::Dest::R(0, 0b0010), dxbc::Src::LF(0.5f / 1023.0f));
+          // Piece 1: byte >= 64.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(64));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 511.5f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-31.5f / 511.5f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 2: byte >= 96.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(96));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 255.75f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-63.5f / 255.75f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 3: byte >= 192.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(192));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 127.875f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-127.5f / 127.875f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // F = float(byte) * recip + offset.
+          a.OpUToF(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j));
+          a.OpMAd(dxbc::Dest::O(0, 1 << j), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kYYYY));
+        }
       } else {
         for (uint32_t i = 0; i < 2; ++i) {
           a.OpUBFE(dxbc::Dest::O(0, 0b11 << (i * 2)), dxbc::Src::LU(16),

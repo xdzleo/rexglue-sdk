@@ -68,7 +68,28 @@ class FunctionDispatcher : public IModuleRegistrar {
                             size_t arg_count);
 
   // Shared thunk region size per module.
-  static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
+  // HEADROOM, NOT A FIX -- and the distinction is the point.
+  //
+  // GetProcAddressByOrdinal (user_module.cpp) calls AllocateThunk on EVERY invocation,
+  // with no memoization and no reclamation. A guest that resolves the same export twice
+  // burns two 4-byte slots; one that resolves in a loop burns the pool. So this constant
+  // does not decide whether the pool can be exhausted, only when: 64KB is 16,384 calls,
+  // 1MB is 262,144. Both are walls; this one is just further away.
+  //
+  // The real fix is to key a cache on (module, target) and hand back the same thunk --
+  // which is also what hardware does, since XexGetProcedureAddress returns a stable
+  // address for a given ordinal. That change alters dispatcher behaviour for all 30
+  // fleet titles and has not been validated at runtime, so it is not in this release.
+  //
+  // Kept at 1MB rather than restored to 64KB because 1MB is the configuration the
+  // fleet's actual gameplay validation ran on (Forza Horizon and Gears of War Judgment,
+  // played end to end). Shrinking it now would ship a memory map nobody has exercised.
+  // An earlier version of this comment claimed a "Thunk address space exhausted"
+  // log line as evidence; no such line exists in any fleet log, and the claim is
+  // withdrawn. The reserve sits immediately after the module code and is overlap-checked
+  // against every registered module (InitializeFunctionTable), so if 1MB ever does
+  // collide, it fails loudly at registration rather than corrupting anything.
+  static constexpr uint32_t kThunkReserveSize = 0x100000;  // 1MB
 
   // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE,
   // or at an explicit function_table_base when the module's manifest overrides it --

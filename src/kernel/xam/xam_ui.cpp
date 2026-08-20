@@ -286,12 +286,30 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
                                    REX_KERNEL_MEMORY()->TranslateVirtual(text_ptr.guest_address())))
                              : "";
 
+  // Empty button labels draw an unclickable ImGui::Button, and button_count == 0
+  // is legal for a plain notice box. Either way MessageBoxDialog::OnDraw (above)
+  // gets an empty buttons_, so nothing inside its BeginPopupModal branch can
+  // reach Close(): the popup keeps returning true, the `else { Close(); }`
+  // escape never runs, close_callback never fires, and the guest thread parked
+  // on fence.Wait() in xeXamDispatchDialog hangs for the life of the process.
+  // So: drop empty labels, and guarantee at least one usable button. Only bites
+  // the non-headless path -- under REXCVAR_GET(headless) below we auto-pick
+  // active_button and never build a dialog. Caveat: filtering renumbers, so
+  // chosen_button() indexes the filtered list when a title interleaves empties.
+  // Adopted from Canary d1e587617 ([UI] Fallback to default button for
+  // XamShowMessageBoxUI).
   std::vector<std::string> buttons;
   for (uint32_t i = 0; i < button_count; ++i) {
     uint32_t button_ptr = button_ptrs[i];
     auto button = rex::memory::load_and_swap<std::u16string>(
         REX_KERNEL_MEMORY()->TranslateVirtual(button_ptr));
-    buttons.push_back(rex::string::to_utf8(button));
+    if (!button.empty()) {
+      buttons.push_back(rex::string::to_utf8(button));
+    }
+  }
+
+  if (buttons.empty()) {
+    buttons.push_back("OK");
   }
 
   X_RESULT result;

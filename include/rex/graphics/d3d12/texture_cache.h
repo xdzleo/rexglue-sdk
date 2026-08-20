@@ -459,6 +459,16 @@ class D3D12TextureCache final : public TextureCache {
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
+  // One bit per xenos::TextureFormat, set when the host DXGI format we would
+  // sample for that guest format reports D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.
+  // Filled in once by Initialize(), read by GetSamplerParameters to force point
+  // sampling for the formats the host cannot linearly filter - Direct3D 12
+  // leaves the result of filtering such a format undefined, and the Vulkan
+  // backend already point-samples them, so without this the two backends draw
+  // the same guest texture differently. Canary 197929d96.
+  uint64_t host_filterable_unsigned_ = 0;
+  uint64_t host_filterable_signed_ = 0;
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.

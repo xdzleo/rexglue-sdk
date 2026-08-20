@@ -119,7 +119,14 @@ float Float7e3To32(uint32_t f10) {
     exponent = uint32_t(1 - int32_t(mantissa_lzcnt));
     mantissa = (mantissa << mantissa_lzcnt) & 0x7F;
   }
-  return rex::memory::Reinterpret<float>(uint32_t(((exponent + 124) << 23) | (mantissa << 3)));
+  // 23 - 7 = 16, not 3: a float32 mantissa is 23 bits and this one is 7, so it belongs at
+  // the TOP of the field. The 3 is the correct shift for the neighbouring 20e4 decoder
+  // (23 - 20) and was copy-pasted from it, which made every nonzero-mantissa 7e3 value
+  // decode to a bare power of two. It feeds host clear colours for k_2_10_10_10_FLOAT --
+  // the standard 360 HDR colour format -- in BOTH backends, and disagreed with our own
+  // shader-side decoder, so clear and transfer produced different colours for one value.
+  // Adopted by content from xenia-canary f3e42609a.
+  return rex::memory::Reinterpret<float>(uint32_t(((exponent + 124) << 23) | (mantissa << 16)));
 }
 
 // Based on CFloat24 from d3dref9.dll and the 6e4 code from:

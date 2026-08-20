@@ -67,11 +67,16 @@ REXCVAR_DEFINE_INT32(anisotropic_override, -1, "GPU",
     .range(-1, 5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 2, "GPU", "Draw resolution scale X (1 = no scaling)")
+// Default 1x1, not 2x2. At 2x2 a 2560x1440 surface renders internally at 5120x2880 --
+// four times the pixels -- which is a large, silent cost on every title, and the seams it
+// introduces at resolve boundaries are why the half-pixel-offset work exists at all.
+// Supersampling is a choice the operator should opt INTO for a title that can afford it,
+// not something every game pays by default. Raise it per title via the cvar.
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 2, "GPU", "Draw resolution scale Y (1 = no scaling)")
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

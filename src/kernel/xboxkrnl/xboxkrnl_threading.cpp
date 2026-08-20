@@ -1178,15 +1178,23 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
                                       timeout_ptr ? &timeout : nullptr);
 }
 
-u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
-                                           u32 r6, mapped_u64 timeout_ptr) {
+// NtSignalAndWaitForSingleObjectEx(SignalHandle, WaitHandle, WaitMode, Alertable, Timeout).
+// Args map positionally to r3.. (include/rex/ppc/function.h:378-384), so the parameter we
+// used to call `alertable` was really reading r5 = WaitMode -- which guest code passes as
+// UserMode(1) nearly every time -- while the guest's actual Alertable flag sat in r6 and
+// was never read. Every SignalAndWait therefore behaved as alertable: a thread that asked
+// for a NON-alertable wait could come back early with X_STATUS_USER_APC and have the
+// DeliverAPCs() below pumped underneath it. Take WaitMode where the API puts it and stop
+// hardcoding processor_mode=1. Prototype fix from Xenia Canary e23376afc.
+u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 wait_mode,
+                                           u32 alertable, mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, wait_mode, alertable,
                                     timeout_ptr ? &timeout : nullptr);
   } else {
     result = X_STATUS_INVALID_HANDLE;

@@ -19,6 +19,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
+#include <rex/system/xio.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 

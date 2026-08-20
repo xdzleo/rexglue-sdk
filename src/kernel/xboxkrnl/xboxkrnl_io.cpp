@@ -708,21 +708,99 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
   return X_STATUS_SUCCESS;
 }
 
-u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapped_u32 out_struct) {
-  // Called from XMountUtilityDrive XAM-task code
-  // That code tries writing things to a pointer at out_struct+0x18
-  // We'll alloc some scratch space for it so it doesn't cause any exceptions
+// Guest device object as the 17559 kernel lays it out. IoCreateDevice only
+// zeroes device_queue / device_lock, so they stay as reserved bytes
+// (X_KDEVICE_QUEUE and X_KEVENT respectively) instead of being modelled here.
+// Layout adopted from xenia-canary 6d530a1ab.
+struct X_DEVICE_OBJECT {
+  be<uint16_t> type;                    // 0x00
+  be<uint16_t> device_extension_size;   // 0x02
+  be<uint32_t> reference_count;         // 0x04
+  be<uint32_t> drive_object_ptr;        // 0x08 -> X_DRIVER_OBJECT
+  be<uint32_t> mounted_or_self_device;  // 0x0C -> X_DEVICE_OBJECT
+  be<uint32_t> current_irp_ptr;         // 0x10 -> X_IRP
+  be<uint32_t> flags;                   // 0x14
+  be<uint32_t> device_extension_ptr;    // 0x18
+  be<uint8_t> device_type;              // 0x1C
+  be<uint8_t> start_io_flags;           // 0x1D
+  be<uint8_t> stack_size;               // 0x1E
+  be<uint8_t> delete_pending;           // 0x1F
+  be<uint32_t> sector_size;             // 0x20, set by XamRamDriveCreate
+  be<uint32_t> alignment;               // 0x24, NtQueryInformationFile verifies this
+  uint8_t device_queue[0x10];           // 0x28, X_KDEVICE_QUEUE
+  uint8_t device_lock[0x10];            // 0x38, X_KEVENT
+  be<uint32_t> start_io_count;          // 0x48
+  be<uint32_t> start_io_key;            // 0x4C
+};
+static_assert_size(X_DEVICE_OBJECT, 0x50);
 
-  // 0x24 is guessed size from accesses to out_struct - likely incorrect
-  auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x24);
+// r4..r7 were placeholders; xenia-canary 6d530a1ab names them, and the same
+// positional order predates that commit.
+u32 IoCreateDevice_entry(u32 driver_object, u32 device_extension_size, u32 device_name,
+                         u32 device_type, u32 extra_device_object_attributes,
+                         mapped_u32 out_struct) {
+  // Called from XMountUtilityDrive XAM-task code.
+  //
+  // What breaks today: we handed back 0x24 bytes for an object the guest
+  // believes is 0x50, so anything it writes at 0x24..0x4F -- device_queue
+  // (0x28), device_lock (0x38), start_io_count (0x48), start_io_key (0x4C) --
+  // lands in whatever guest heap block happens to follow. Every descriptive
+  // field (type, device_type, flags, stack_size, device_extension_size,
+  // mounted_or_self_device, drive_object_ptr) was also left zero, so
+  // XMountUtilityDrive read a device that claims to be nothing at all.
+  // Field values and the device_type list are from xenia-canary 6d530a1ab.
+  //
+  // The extension is no longer a separate 0x1000 scratch block hung off +0x18:
+  // as on console it is the tail of this same allocation, sized by what the
+  // caller asked for. A caller passing device_extension_size == 0 now gets a
+  // NULL device_extension_ptr instead of our old always-valid scratch. That is
+  // the console behaviour; a guest that writes through it anyway was relying on
+  // the workaround.
+  const uint32_t aligned_extension_size = (device_extension_size + 7u) & ~7u;
+  const uint32_t required_size =
+      static_cast<uint32_t>(sizeof(X_DEVICE_OBJECT)) + aligned_extension_size;
 
-  auto out = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(out_guest);
-  memset(out, 0, 0x24);
+  auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(required_size);
+  if (!out_guest) {
+    // Not in Canary: TranslateVirtual(0) is base+0, so memsetting an unchecked
+    // allocation failure would scribble over guest address 0.
+    return X_STATUS_INSUFFICIENT_RESOURCES;
+  }
 
-  // XMountUtilityDrive writes some kind of header here
-  // 0x1000 bytes should be enough to store it
-  auto out_guest2 = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x1000);
-  memory::store_and_swap(out + 0x18, out_guest2);
+  auto out = REX_KERNEL_MEMORY()->TranslateVirtual<X_DEVICE_OBJECT*>(out_guest);
+  memset(out, 0, required_size);
+
+  out->type = 3;  // maybe device object's Ob type?
+
+  // this stores the total object size, without alignment!
+  out->device_extension_size =
+      static_cast<uint16_t>(device_extension_size + sizeof(X_DEVICE_OBJECT));
+
+  // from 17559
+  if (device_type == 7 || device_type == 58 || device_type == 62 || device_type == 45 ||
+      device_type == 2 || device_type == 60 || device_type == 61 || device_type == 36 ||
+      device_type == 64 || device_type == 65 || device_type == 66 || device_type == 67 ||
+      device_type == 68 || device_type == 69 || device_type == 70 || device_type == 72 ||
+      device_type == 73) {
+    out->mounted_or_self_device = 0;
+  } else {
+    out->mounted_or_self_device = out_guest;
+  }
+  out->device_type = static_cast<uint8_t>(device_type);
+
+  uint32_t flags_field_value = 16;
+  if (device_name) {  // pointer_t<X_ANSI_STRING> on Canary; only tested for null
+    flags_field_value |= 8;
+  }
+  out->stack_size = 1;
+  out->flags = flags_field_value;
+  if (device_extension_size != 0) {
+    // pointer to device specific data
+    // XMountUtilityDrive writes some kind of header here
+    out->device_extension_ptr = out_guest + static_cast<uint32_t>(sizeof(X_DEVICE_OBJECT));
+  }
+
+  out->drive_object_ptr = driver_object;
 
   *out_struct = out_guest;
   return X_STATUS_SUCCESS;

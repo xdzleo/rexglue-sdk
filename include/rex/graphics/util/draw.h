@@ -584,9 +584,21 @@ struct ResolveInfo {
     // Not doing -32...32 to -1...1 clamping here as a hack for k_16_16 and
     // k_16_16_16_16 blending emulation when using host render targets as it
     // would be inconsistent with the usual way of clearing with a depth quad.
-    // TODO(Triang3l): Check which 32-bit portion is in which register.
-    constants_out.rt_specific.clear_value[0] = rb_color_clear;
-    constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
+    // Canary 16e1eb8e2 settled the register order this used to carry a TODO about. For 64bpp
+    // formats D3D builds the low dword as R | G << 16 and the high dword as B | A << 16, writing
+    // the low one to RB_COLOR_CLEAR_LO and the high one to RB_COLOR_CLEAR - and the 64bpp clear
+    // shader stores clear_value.xyxy, so slot 0 is the low dword. We had the two the wrong way
+    // round, which swapped RG with BA in every k_16_16_16_16 / k_32_32_FLOAT resolve clear.
+    // At 32bpp the whole value is in RB_COLOR_CLEAR and _LO is stale; the 32bpp clear shader
+    // only reads clear_value.x, so mirroring the value into slot 1 just keeps the unused half
+    // from carrying garbage (same shape as GetDepthClearShaderConstants above).
+    if (color_edram_info.format_is_64bpp) {
+      constants_out.rt_specific.clear_value[0] = rb_color_clear_lo;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    } else {
+      constants_out.rt_specific.clear_value[0] = rb_color_clear;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    }
     constants_out.rt_specific.edram_info = color_edram_info;
     constants_out.coordinate_info = coordinate_info;
   }

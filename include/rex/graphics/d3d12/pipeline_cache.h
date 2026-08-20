@@ -97,6 +97,17 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // Companion to GetD3D12PipelineByHandle, for re-reading the root signature AFTER the
+  // readiness gate. The creation thread release-stores the root signature and only then
+  // release-stores the state, so an acquire-load that observes a non-null state
+  // happens-after the root signature store -- reading it in that order is guaranteed to
+  // see the final value rather than the placeholder.
+  ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
+    return handle ? static_cast<const Pipeline*>(handle)->root_signature.load(
+                        std::memory_order_acquire)
+                  : nullptr;
+  }
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;

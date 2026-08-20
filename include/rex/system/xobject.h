@@ -68,42 +68,35 @@ typedef struct {
 } X_DISPATCH_HEADER;
 static_assert_size(X_DISPATCH_HEADER, 0x10);
 
-// https://www.nirsoft.net/kernel_struct/vista/OBJECT_HEADER.html
+// The Xbox 360 OBJECT_HEADER -- deliberately NOT the NT/Vista x86 layout that
+// used to sit here. The 360 kernel has no name/handle/quota info offsets and no
+// create-info pointer, so the borrowed struct was 0x18 bytes where the real one
+// is 0x10, and that size is load-bearing: XObject::CreateNative allocates
+// size + sizeof(X_OBJECT_HEADER) and hands the guest its body at
+// mem + sizeof(X_OBJECT_HEADER) (src/system/xobject.cpp:320,330), with the
+// destructor walking back by the same amount (:56). The extra 8 bytes put
+// pointer_count and handle_count at body-0x18/-0x14 instead of the body-0x10/
+// -0x0C a guest expects from OBJECT_TO_OBJECT_HEADER(obj); only object_type_ptr
+// landed correctly (body-0x08 either way), which is the sole reason nothing has
+// fallen over yet. Worth fixing before anything is built on top of it -- our
+// ObCreateObject/ObInsertObject/ObReferenceObject are still REX_EXPORT_STUB in
+// src/kernel/xboxkrnl/xboxkrnl_ob.cpp.
+//
+// Adopted from Xenia Canary 889d93e13 ("[Kernel] Fixed X_OBJECT_HEADER") as
+// corrected by fe40c0d68 ("[Kernel] Fixed regression related to
+// X_OBJECT_HEADER struct", which dropped the padding/used tail that had left it
+// at 0x18). X_OBJECT_CREATE_INFORMATION went with it in the same commit: it is
+// not a 360 structure and had no users in this tree.
 struct X_OBJECT_HEADER {
-  rex::be<uint32_t> pointer_count;
-  union {
-    rex::be<uint32_t> handle_count;
-    rex::be<uint32_t> next_to_free;
-  };
-  uint8_t name_info_offset;
-  uint8_t handle_info_offset;
-  uint8_t quota_info_offset;
-  uint8_t flags;
-  union {
-    rex::be<uint32_t> object_create_info;  // X_OBJECT_CREATE_INFORMATION
-    rex::be<uint32_t> quota_block_charged;
-  };
-  rex::be<uint32_t> object_type_ptr;  // -0x8 POBJECT_TYPE
-  rex::be<uint32_t> unk_04;           // -0x4
+  rex::be<int32_t> pointer_count;     // -0x10
+  rex::be<int32_t> handle_count;      // -0x0C
+  rex::be<uint32_t> object_type_ptr;  // -0x08 X_OBJECT_TYPE*
+  rex::be<int16_t> flags;             // -0x04
+  rex::be<int8_t> hash_index;         // -0x02
 
   // Object lives after this header.
-  // (There's actually a body field here which is the object itself)
 };
-
-// https://www.nirsoft.net/kernel_struct/vista/OBJECT_CREATE_INFORMATION.html
-struct X_OBJECT_CREATE_INFORMATION {
-  rex::be<uint32_t> attributes;                  // 0x0
-  rex::be<uint32_t> root_directory_ptr;          // 0x4
-  rex::be<uint32_t> parse_context_ptr;           // 0x8
-  rex::be<uint32_t> probe_mode;                  // 0xC
-  rex::be<uint32_t> paged_pool_charge;           // 0x10
-  rex::be<uint32_t> non_paged_pool_charge;       // 0x14
-  rex::be<uint32_t> security_descriptor_charge;  // 0x18
-  rex::be<uint32_t> security_descriptor;         // 0x1C
-  rex::be<uint32_t> security_qos_ptr;            // 0x20
-
-  // Security QoS here (SECURITY_QUALITY_OF_SERVICE) too!
-};
+static_assert_size(X_OBJECT_HEADER, 0x10);
 
 struct X_OBJECT_TYPE {
   rex::be<uint32_t> constructor;  // 0x0

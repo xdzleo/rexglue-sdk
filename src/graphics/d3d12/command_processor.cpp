@@ -246,10 +246,13 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
       return true;
     }
 
+    // Either word alone is enough - not every D3D version stamps both halves of the pair before
+    // the END packet. Requiring both (&&) made us miss the END, so the fake count was never
+    // written back and the guest read zero passed samples forever. Canary 8a49c0380.
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -301,10 +304,13 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     if (fake_sample_count < 0) {
       return true;
     }
+    // Either word alone is enough - see the END detection below. This has to stay in step with
+    // it, or the fallback would refuse to write the fake count for the very packet the caller
+    // already classified as an END. Canary 8a49c0380.
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -313,10 +319,16 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return true;
   };
 
+  // Either word alone is enough - not every D3D version stamps both halves of the pair before the
+  // END packet. Requiring both (&&) hurts more here than in the fake-count fallback: a missed END
+  // is read as a second BEGIN, BeginGuestOcclusionQuery then takes its "begin while another query
+  // is active" path, and that calls DisableHostOcclusionQueries() - one dropped sentinel turns
+  // host occlusion queries off for the rest of the run. Canary 8a49c0380 (culling flicker in
+  // 555307D5).
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -2751,6 +2763,28 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
       return true;
     }
+    // Re-read the root signature now that the state is known non-null.
+    //
+    // The reader and the writer disagreed on order. The creation thread stores the root
+    // signature FIRST and the state SECOND (pipeline_cache.cpp, PrepareRuntimeDescription
+    // ForQueuedCreation then the state.store), while ConfigurePipeline wrote
+    // *root_signature_out BEFORE this gate ever ran. For a still-pending async pipeline
+    // the stored signature is the PLACEHOLDER -- VS-only, because
+    // GetCurrentStateDescription is invoked with for_placeholder and passes nullptr for
+    // the pixel shader. So an interleaving of read-RS(placeholder) -> store-RS(real) ->
+    // store-state(real) -> gate-passes binds a VS-only root signature under a PSO built
+    // against the full one: a root signature / PSO mismatch, which is device removal, not
+    // a visible error.
+    //
+    // Unreachable today only by luck of timing -- the two stores are separated by an
+    // entire CreateGraphicsPipelineState while the two reads are a few instructions
+    // apart, and the EndSubmission wait makes it moot besides. Both of those are
+    // accidents, and the second one is exactly what the async-pipeline work would remove.
+    // Reading in the writer's order costs nothing and does not depend on either.
+    if (ID3D12RootSignature* settled =
+            pipeline_cache_->GetRootSignatureByHandle(pipeline_handle)) {
+      root_signature = settled;
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -4015,6 +4049,31 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
       primitive_processor_->EndFrame();
     }
+
+    // Close the perf frame.
+    //
+    // kFrameTimeUs had a name, a column in the CSV, a reader in the debug overlay and a
+    // PROFILE_FRAME_TIME_US macro -- and NOTHING ever wrote to it. Anything read out of
+    // that column was leftover array contents, not a frame time, and it is measured here
+    // now: wall-clock between consecutive frame closes, which is the interval the player
+    // actually experiences.
+    //
+    // Order is load-bearing. ResetFrameCounters() copies the live accumulators into the
+    // snapshot and zeroes them; WriteCsvFrame() serialises that snapshot. Writing first
+    // emits the PREVIOUS frame's numbers against this frame's row, which silently shifts
+    // every correlation by one frame.
+    {
+      static std::chrono::steady_clock::time_point last_frame_close{};
+      auto now = std::chrono::steady_clock::now();
+      if (last_frame_close.time_since_epoch().count() != 0) {
+        auto delta_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame_close).count();
+        PROFILE_FRAME_TIME_US(static_cast<int64_t>(delta_us));
+      }
+      last_frame_close = now;
+    }
+    rex::perf::ResetFrameCounters();
+    rex::perf::WriteCsvFrame();
   }
 
   if (submission_open_) {

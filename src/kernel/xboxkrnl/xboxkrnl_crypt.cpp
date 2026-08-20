@@ -93,6 +93,14 @@ typedef struct {
 } XECRYPT_SHA_STATE;
 static_assert_size(XECRYPT_SHA_STATE, 0x58);
 
+// Two chained SHA-1 states: [0] is the inner (0x36 pad) hash, [1] the outer (0x5C
+// pad). Layout from Canary cebbdb6ca,
+// src/xenia/kernel/xboxkrnl/xboxkrnl_crypt.cc:51-54.
+typedef struct {
+  XECRYPT_SHA_STATE sha_state[2];  // 0x0 inner, 0x58 outer
+} XECRYPT_HMACSHA_STATE;
+static_assert_size(XECRYPT_HMACSHA_STATE, 0xB0);
+
 void InitSha1(sha1::SHA1* sha, const XECRYPT_SHA_STATE* state) {
   uint32_t digest[5];
   std::copy(std::begin(state->state), std::end(state->state), digest);
@@ -558,6 +566,70 @@ void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u
   std::memcpy(out, digest, std::min((uint32_t)out_size, 0x14u));
 }
 
+// Incremental HMAC-SHA1. These were bare REX_EXPORT_STUBs, so Final never touched the
+// caller's output buffer and the guest compared its own stack garbage against a real
+// MAC -- an arbitrary pass/fail on whatever it was verifying. The two-state structure
+// and the Update/Final chaining come from Canary cebbdb6ca
+// (src/xenia/kernel/xboxkrnl/xboxkrnl_crypt.cc:497-537); the key padding is derived
+// from XeCryptHmacSha_entry above instead, because Canary's Init only XORs the first
+// key_size bytes of the 64-byte pads and leaves the rest 0x00 rather than 0x36/0x5C,
+// so its incremental path disagrees with its own one-shot.
+void XeCryptHmacShaInit_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> hmac_state, mapped_void key,
+                              u32 key_size_in) {
+  uint32_t key_size = key_size_in;
+  uint8_t kpad_i[0x40];
+  uint8_t kpad_o[0x40];
+  uint8_t tmp_key[0x40];
+  std::memset(kpad_i, 0x36, 0x40);
+  std::memset(kpad_o, 0x5C, 0x40);
+
+  // Setup HMAC key
+  // If > block size, use its hash
+  if (key_size > 0x40) {
+    sha1::SHA1 sha_key;
+    sha_key.processBytes(key, key_size);
+    sha_key.finalize((uint8_t*)tmp_key);
+
+    key_size = 0x14u;
+  } else {
+    std::memcpy(tmp_key, key, key_size);
+  }
+
+  for (uint32_t i = 0; i < key_size; i++) {
+    kpad_i[i] = tmp_key[i] ^ 0x36;
+    kpad_o[i] = tmp_key[i] ^ 0x5C;
+  }
+
+  auto inner = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&hmac_state->sha_state[0]);
+  auto outer = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&hmac_state->sha_state[1]);
+
+  XeCryptShaInit_entry(inner);
+  XeCryptShaInit_entry(outer);
+
+  XeCryptShaUpdate_entry(inner, mapped_void::from_host(kpad_i), 0x40);
+  XeCryptShaUpdate_entry(outer, mapped_void::from_host(kpad_o), 0x40);
+}
+
+void XeCryptHmacShaUpdate_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> hmac_state, mapped_void input,
+                                u32 input_size) {
+  XeCryptShaUpdate_entry(ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&hmac_state->sha_state[0]), input,
+                         input_size);
+}
+
+void XeCryptHmacShaFinal_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> hmac_state, ppc_ptr_t<uint8_t> out,
+                               u32 out_size) {
+  auto inner = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&hmac_state->sha_state[0]);
+  auto outer = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&hmac_state->sha_state[1]);
+
+  // Canary finalizes the inner state into nowhere and then re-reads its state[] words.
+  // XeCryptShaFinal_entry already emits those same five words big-endian, so take the
+  // digest straight out and feed it to the outer hash.
+  uint8_t inner_digest[0x14];
+  XeCryptShaFinal_entry(inner, ppc_ptr_t<uint8_t>::from_host(inner_digest), 0x14u);
+  XeCryptShaUpdate_entry(outer, mapped_void::from_host(inner_digest), 0x14u);
+  XeCryptShaFinal_entry(outer, out, out_size);
+}
+
 // Keys
 // TODO: Array of keys we need
 
@@ -678,9 +750,8 @@ REX_EXPORT_STUB(__imp__XeCryptHmacMd5Init);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Update);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Final);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaInit);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaUpdate);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaFinal);
+// XeCryptHmacSha{Init,Update,Final} are exported for real at the bottom of this file.
+// XeCryptHmacShaVerify stays a stub -- neither we nor Canary have its semantics.
 REX_EXPORT_STUB(__imp__XeCryptHmacShaVerify);
 REX_EXPORT_STUB(__imp__XeCryptMd5Init);
 REX_EXPORT_STUB(__imp__XeCryptMd5Update);
@@ -801,6 +872,9 @@ REX_EXPORT(__imp__XeCryptAesKey, rex::kernel::xboxkrnl::XeCryptAesKey_entry)
 REX_EXPORT(__imp__XeCryptAesEcb, rex::kernel::xboxkrnl::XeCryptAesEcb_entry)
 REX_EXPORT(__imp__XeCryptAesCbc, rex::kernel::xboxkrnl::XeCryptAesCbc_entry)
 REX_EXPORT(__imp__XeCryptHmacSha, rex::kernel::xboxkrnl::XeCryptHmacSha_entry)
+REX_EXPORT(__imp__XeCryptHmacShaInit, rex::kernel::xboxkrnl::XeCryptHmacShaInit_entry)
+REX_EXPORT(__imp__XeCryptHmacShaUpdate, rex::kernel::xboxkrnl::XeCryptHmacShaUpdate_entry)
+REX_EXPORT(__imp__XeCryptHmacShaFinal, rex::kernel::xboxkrnl::XeCryptHmacShaFinal_entry)
 REX_EXPORT(__imp__XeKeysHmacSha, rex::kernel::xboxkrnl::XeKeysHmacSha_entry)
 REX_EXPORT(__imp__XeKeysAesCbcUsingKey, rex::kernel::xboxkrnl::XeKeysAesCbcUsingKey_entry)
 REX_EXPORT(__imp__XeKeysObscureKey, rex::kernel::xboxkrnl::XeKeysObscureKey_entry)

@@ -111,7 +111,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    // 2026-08-19: added rt0_blend_rgb/a_factor_for_premult to
+    // PixelShaderModification for MIN/MAX blend factor emulation - stored
+    // pipelines written before this decode 0 in those bits, which is
+    // BlendFactor::kZero rather than kOne, and would black out RT0
+    // (Canary 067641668).
+    static constexpr uint32_t kVersion = 0x20260819;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -176,6 +181,16 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // Non-ROV, RT0 only - the source blend factor the pixel shader must
+      // pre-multiply its output by. D3D12 fixed-function blending ignores the
+      // blend factors entirely for MIN/MAX, but the Xbox 360 applies them
+      // before the min/max, so a MIN/MAX draw with a kSrcAlpha source factor
+      // blends as if the factor were ONE. The destination is not readable in
+      // this path, so only the source side can be emulated - the pipeline cache
+      // sets these only when the destination factor is ONE. kOne means no
+      // pre-multiply. Canary 067641668.
+      xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
+      xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {

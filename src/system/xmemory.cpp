@@ -1132,6 +1132,18 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
 void BaseHeap::Reset() {
   // TODO(DrChat): protect pages.
   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
+  // The page table now says every page is free, so the counter has to say so too.
+  // unreserved_page_count_ is set once in Initialize and only ever stepped by
+  // Alloc/Release afterwards, so without this a Reset leaves it stuck at the
+  // pre-Reset value FOREVER. It is read by unreserved_page_count() in
+  // Memory::GetHeapsPageStatsSummary, which feeds used/available pages straight into
+  // the guest's memory-status export -- so the title is permanently told it has less
+  // free physical memory than it does, and the assert_true(used_pages <
+  // total_physical_pages) in xboxkrnl_memory.cpp sits on top of the same drift.
+  // Reached from XexModule teardown and Memory::Reset. Handing the guest a wrong
+  // number is the failure class we care most about.
+  // Adopted by content from xenia-canary ea02e8d31.
+  unreserved_page_count_ = uint32_t(page_table_.size());
   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
   // memory heap.
 }
@@ -1769,7 +1781,11 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   uint32_t address = heap_base_ + parent_address - parent_heap_start;
   if (!BaseHeap::AllocFixed(address, size, alignment, allocation_type, protect)) {
     REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
+    // Release what we reserved in the parent before bailing out. Reserving there
+    // and then failing to pin it here left the parent's 0-512MB physical range
+    // holding a block nobody owns and nobody can free -- one per failure, for the
+    // life of the process. Adopted by content from xenia-canary ea02e8d31.
+    parent_heap_->Release(parent_address);
     return false;
   }
   *out_address = address;
@@ -1799,7 +1815,11 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   uint32_t address = heap_base_ + parent_base_address - GetPhysicalAddress(heap_base_);
   if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
     REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
+    // Release what we reserved in the parent before bailing out. Reserving there
+    // and then failing to pin it here left the parent's 0-512MB physical range
+    // holding a block nobody owns and nobody can free -- one per failure, for the
+    // life of the process. Adopted by content from xenia-canary ea02e8d31.
+    parent_heap_->Release(parent_base_address);
     return false;
   }
 
@@ -1834,7 +1854,11 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   uint32_t address = heap_base_ + parent_address - GetPhysicalAddress(heap_base_);
   if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
     REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
+    // Release what we reserved in the parent before bailing out. Reserving there
+    // and then failing to pin it here left the parent's 0-512MB physical range
+    // holding a block nobody owns and nobody can free -- one per failure, for the
+    // life of the process. Adopted by content from xenia-canary ea02e8d31.
+    parent_heap_->Release(parent_address);
     return false;
   }
   *out_address = address;

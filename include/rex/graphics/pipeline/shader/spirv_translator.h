@@ -33,7 +33,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    // 13: the stacked-texture inter-layer lerp now adds the difference to the
+    // first sample rather than the second, and the uint4/float4 OpSelects now
+    // take a smeared bool4 condition. Both change the emitted SPIR-V for the
+    // same modification bits, so pipelines cached at version 12 would be
+    // reused with wrong stacked-texture pixels and, pre-1.4, malformed selects.
+    // Canary e519d59e4 / 6de637b79 (Canary went 10 -> 11; our counter is ahead).
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -88,6 +94,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // For host render targets, RT0 only - the source blend factor the
+      // fragment shader must pre-multiply its output by. Vulkan's
+      // VK_BLEND_OP_MIN/MAX ignore the blend factors entirely, but the Xbox 360
+      // applies them before the min/max, so a MIN/MAX draw with a kSrcAlpha
+      // source factor blends as if the factor were ONE. The destination is not
+      // readable in this path, so only the source side can be emulated - the
+      // pipeline cache sets these only when the destination factor is ONE.
+      // kOne means no pre-multiply. Canary 067641668.
+      xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
+      xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
     } pixel;
     uint64_t value = 0;
 
@@ -943,9 +959,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id type_output_per_vertex_;
   spv::Id output_per_vertex_;
 
-  // With fragment shader interlock, variables in the main function.
-  // Otherwise, framebuffer color attachment outputs.
+  // Function-scoped color variables in the main function, on BOTH the fragment
+  // shader interlock path and the host render target path. Kept readable for
+  // the whole shader so the alpha test and alpha to coverage can load the alpha
+  // back - SPIR-V Output variables are write-only, and reading one is exactly
+  // the bug Canary 966d8f092 removed. On the host render target path these are
+  // copied into output_fragment_data_ at the end of
+  // CompleteFragmentShaderInMain.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_or_var_fragment_data_;
+  // Host render targets only - the real framebuffer color attachment outputs
+  // (Output storage, write-only). Created in StartFragmentShaderBeforeMain and
+  // written exactly once, at the end of CompleteFragmentShaderInMain, from
+  // output_or_var_fragment_data_. Canary 966d8f092.
+  std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
   // For host render targets and only when needed - float.
   spv::Id output_fragment_depth_;
   // For host render targets and only when needed - int[1].
@@ -967,6 +993,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // `base + index * stride` in dwords from the last vfetch_full as it may be
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
+  // Exclusive end (base + size) in dwords of the last vfetch_full's buffer, so
+  // that it and its vfetch_mini can clamp out-of-bounds words to 0. The shared
+  // memory binding covers all of physical memory, so without this a word past
+  // the size in the fetch constant reads unrelated guest data instead of the
+  // zeros the hardware returns, and an overallocated draw comes out as stray
+  // geometry rather than the degenerate primitives the title expects.
+  // Canary 9e9d3cdd3 - int.
+  spv::Id var_main_vfetch_bound_;
   // float.
   spv::Id var_main_tfetch_lod_;
   // float3.
@@ -1004,11 +1038,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_kill_pixel_;
   // PS, with fragment shader interlock and depth export - float.
   spv::Id var_main_fragment_depth_;
-  // PS, only when writing to color render targets with fragment shader
-  // interlock - uint.
+  // PS, whenever the shader writes to color render targets - uint. Created on
+  // both the fragment shader interlock and the host render target paths since
+  // Canary 966d8f092 (the name is kept for churn reasons; it is no longer FSI
+  // only).
   // Whether color buffers have been written to, if not written on the taken
   // execution path, don't export according to Direct3D 9 register documentation
-  // (some games rely on this behavior).
+  // (some games rely on this behavior). On the host render target path this is
+  // what lets the alpha test and alpha to coverage be skipped entirely when
+  // render target 0 was never written, instead of testing the zero-initialized
+  // output.
   spv::Id var_main_fsi_color_written_;
   // Loaded by FSI_LoadSampleMask.
   // Can be modified on the outermost control flow level in the main function.

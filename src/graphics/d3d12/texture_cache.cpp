@@ -405,6 +405,36 @@ bool D3D12TextureCache::Initialize() {
   }
   scaled_resolve_heap_count_ = 0;
 
+  // Probe once, per guest texture format, whether the host DXGI format we would
+  // sample can actually be sampled with a linear filter. GetSamplerParameters
+  // drops linear and anisotropic filtering for the rest: asking Direct3D 12 to
+  // filter a format that does not report D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE
+  // gives an undefined result, and our Vulkan backend already point-samples
+  // those formats, so leaving this out made the two backends render the same
+  // guest texture differently. Canary 197929d96.
+  host_filterable_unsigned_ = 0;
+  host_filterable_signed_ = 0;
+  for (uint32_t i = 0; i < uint32_t(rex::countof(host_formats_)); ++i) {
+    const HostFormat& host_format = host_formats_[i];
+    uint64_t format_bit = uint64_t(1) << i;
+    if (host_format.dxgi_format_unsigned != DXGI_FORMAT_UNKNOWN) {
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {host_format.dxgi_format_unsigned};
+      if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                                                sizeof(format_support))) &&
+          (format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) {
+        host_filterable_unsigned_ |= format_bit;
+      }
+    }
+    if (host_format.dxgi_format_signed != DXGI_FORMAT_UNKNOWN) {
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {host_format.dxgi_format_signed};
+      if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                                                sizeof(format_support))) &&
+          (format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) {
+        host_filterable_signed_ |= format_bit;
+      }
+    }
+  }
+
   // Create the loading root signature.
   D3D12_ROOT_PARAMETER root_parameters[3];
   // Parameter 0 is constants (changed multiple times when untiling).
@@ -987,6 +1017,29 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   }
   parameters.mip_base_map = mip_base_map;
+
+  // Fall back to point sampling when the host DXGI format for this texture does
+  // not report D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE. Filtering such a format is
+  // undefined on Direct3D 12, and the Vulkan backend already does this, so
+  // without it the two backends disagreed on the same guest texture.
+  // Canary 197929d96.
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
+      parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
+    TextureKey texture_key;
+    uint8_t texture_swizzled_signs;
+    BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
+    uint64_t format_bit = texture_key.is_valid ? uint64_t(1) << uint32_t(texture_key.format) : 0;
+    if (!texture_key.is_valid ||
+        (texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
+         (host_filterable_unsigned_ & format_bit) == 0) ||
+        (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
+         (host_filterable_signed_ & format_bit) == 0)) {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+    }
+  }
 
   return parameters;
 }
@@ -2004,6 +2057,16 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   desc.Alignment = 0;
   desc.Width = key().GetWidth();
   desc.Height = key().GetHeight();
+  if (key().scaled_resolve) {
+    // The wrapper must be built at the SCALED size, because LoadTextureData writes scaled
+    // data into it -- built unscaled, the compute shader writes past the resource and the
+    // device is removed. The Vulkan half of this already does it (vulkan/texture_cache.cpp,
+    // the scaled_resolve block in the VkImageCreateInfo path); only D3D12 was left behind,
+    // and gpu_3d_to_2d_texture defaults ON, so this crash is live by default.
+    // Adopted by content from xenia-canary 48111e8fb.
+    desc.Width *= d3d12_cache.draw_resolution_scale_x();
+    desc.Height *= d3d12_cache.draw_resolution_scale_y();
+  }
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());

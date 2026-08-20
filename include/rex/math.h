@@ -314,4 +314,25 @@ inline T sat_sub(T a, T b) {
   return T(result);
 }
 
+// Rounds a value to a single significant digit (0.0123 -> 0.01, 3.7e-4 -> 4e-4).
+// Used to quantize the guest polygon offset slope scale before it reaches the
+// D3D12 PipelineDescription: that struct is hashed bytewise
+// (XXH3_64bits(&description, sizeof(description)) in d3d12/pipeline_cache.cpp),
+// and depth_bias_slope_scaled is a raw float member, so every distinct value a
+// title feeds mints a brand new pipeline state object that is never freed. A
+// title that sweeps the register continuously therefore takes a pipeline cache
+// miss and a mid-frame PSO creation on every polygonal draw, with unbounded
+// memory growth behind it. Collapsing the key space costs three libm calls per
+// polygonal draw, which is orders of magnitude cheaper than compiling a PSO.
+// Ported from Xenia Canary 8c44649f0.
+template <typename T>
+inline T round_to_nearest_order_of_magnitude(T value) {
+  if (!value) {
+    return value;
+  }
+  const double order = std::pow(10.0, std::floor(std::log10(std::fabs(double(value)))));
+  const double rounded = std::round(double(value) / order) * order;
+  return static_cast<T>(rounded);
+}
+
 }  // namespace rex

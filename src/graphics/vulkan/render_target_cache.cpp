@@ -1669,8 +1669,15 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                                  clear_render_targets[1], clear_transfers_[1])) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
-          clear_values[1] =
-              resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+          // RB_COLOR_CLEAR_LO holds the LOW 32 bits of a 64bpp packed clear value and
+          // RB_COLOR_CLEAR the high 32; at 32bpp RB_COLOR_CLEAR is the whole value and _LO is
+          // stale. We had the halves the wrong way round, so the host render target clear
+          // decomposition (which reads bits 0..31 as R/G and 32..63 as B/A) came out with RG and
+          // BA exchanged for k_16_16_16_16 and k_32_32_FLOAT. Canary 16e1eb8e2.
+          clear_values[1] = resolve_info.color_edram_info.format_is_64bpp
+                                ? resolve_info.rb_color_clear_lo |
+                                      (uint64_t(resolve_info.rb_color_clear) << 32)
+                                : resolve_info.rb_color_clear;
           if (REXCVAR_GET(vulkan_deferred_resolve_clears) && clear_transfers_[0].empty() &&
               clear_transfers_[1].empty()) {
             // Defer the clears to the next render pass binding these render
@@ -2113,7 +2120,15 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
                                              : VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+      // A8B8G8R8 gives this guest format 8 bits per channel, so every 2_10_10_10 colour
+      // render target -- one of the standard 360 HDR formats -- was quantised from 10-bit
+      // to 8-bit on Vulkan, and the EDRAM ownership-transfer shader packed 10/10/10/2
+      // fields into a target with no room for them. D3D12 already returns
+      // DXGI_FORMAT_R10G10B10A2_UNORM here and our own Vulkan TEXTURE cache already uses
+      // A2B10G10R10 for the same guest format, so the render-target path was the one place
+      // left inconsistent with both.
+      // Adopted by content from xenia-canary dc66d67a3.
+      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -4117,6 +4132,18 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                                         builder.makeUintConstant(8), builder.makeUintConstant(24));
         }
       }
+    }
+    // For a stencil bit destination the source depth texture is deliberately not
+    // created (see the kStencilBit gate on source_depth_texture above), so with a
+    // depth/stencil source neither branch above ever assigns `packed` and the
+    // OpKill in the kStencilBit case below is compiled out entirely. The transfer
+    // then writes the stencil bit for every fragment instead of only the ones
+    // that already have it set, so stencil is incremented on every transfer draw
+    // until it saturates at 0xFF and every later stencil-tested draw is wrong.
+    // Feed the raw stencil sample in so the discard test has a value to test.
+    // Backported from xenia-canary 24f90c0ef.
+    if (packed == spv::NoResult && mode.output == TransferOutput::kStencilBit) {
+      packed = source_stencil[0];
     }
     switch (mode.output) {
       case TransferOutput::kColor: {

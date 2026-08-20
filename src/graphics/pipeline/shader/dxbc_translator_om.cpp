@@ -1563,6 +1563,129 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       }
       a_.OpEndIf();
     }
+    // D3D12 fixed-function blending ignores the blend factors for MIN/MAX, but
+    // the Xbox 360 applies them before the min/max, so without this a MIN/MAX
+    // draw with a kSrcAlpha source factor blends as if the factor were ONE.
+    // The destination is not readable here, so only the source side is
+    // emulated, by pre-multiplying the shader output; PipelineCache::
+    // GetCurrentPixelShaderModification only requests this when the
+    // destination factor is ONE. RT0 only. Canary 067641668.
+    if (i == 0 && !edram_rov_used_) {
+      xenos::BlendFactor rgb_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_rgb_factor_for_premult;
+      xenos::BlendFactor a_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_a_factor_for_premult;
+      bool premult_rgb = rgb_factor_for_premult != xenos::BlendFactor::kOne;
+      bool premult_a = a_factor_for_premult != xenos::BlendFactor::kOne;
+      if (premult_rgb || premult_a) {
+        uint32_t premult_temp = PushSystemTemp();
+        if (premult_rgb) {
+          switch (rgb_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kSrcAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kXYZW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kXYZW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            default:
+              // kOne, or a factor needing the destination - nothing to do.
+              break;
+          }
+        }
+        if (premult_a) {
+          switch (a_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b1000), dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+            case xenos::BlendFactor::kSrcAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kSrcAlphaSaturate:
+              // For alpha, kSrcAlphaSaturate is 1.0 - nothing to do.
+              break;
+            default:
+              // kOne, or a factor needing the destination - nothing to do.
+              break;
+          }
+        }
+        // Release premult_temp.
+        PopSystemTemp();
+      }
+    }
     // Copy the color from a readable temp register to an output register.
     a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temp_color));
   }
@@ -2303,30 +2426,121 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
             a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
           }
           // Need to do min/max for color.
+          // The Xbox 360 applies the source and destination factors BEFORE the
+          // min/max - unlike D3D12/Vulkan fixed-function blending, which
+          // ignores them entirely for those ops. Taking min/max of the raw
+          // colors made every MIN/MAX draw with a non-ONE source factor
+          // (typically kSrcAlpha) blend as if the factor were ONE.
+          // Canary 067641668.
           a_.OpElse();
           {
-            // Extract the color min (0) or max (1) bit to temp.x
+            uint32_t blend_src_temp = PushSystemTemp();
+            dxbc::Dest blend_src_temp_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
+            dxbc::Src blend_src_temp_src(dxbc::Src::R(blend_src_temp));
+
+            // Extract the source color factor to temp.x.
+            // temp.x = source color factor index.
+            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
+            // Check if the source color factor is not zero - if it is, the
+            // source must be ignored completely, and Infinity and NaN in it
+            // shouldn't affect blending.
+            a_.OpIf(true, temp_x_src);
+            {
+              // temp.x = free.
+              a_.OpSwitch(temp_x_src);
+              // blend_src_temp.xyz = unclamped source color factor.
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_src_temp);
+              a_.OpEndSwitch();
+              // temp.x = whether color is fixed-point.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                // blend_src_temp.xyz = source color factor.
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // blend_src_temp.xyz = source color multiplied by its factor.
+              a_.OpMul(blend_src_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
+                       blend_src_temp_src);
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+            }
+            // The source color factor is zero.
+            a_.OpElse();
+            {
+              a_.OpMov(blend_src_temp_rgb_dest, dxbc::Src::LF(0.0f));
+            }
+            a_.OpEndIf();
+
+            uint32_t blend_dest_temp = PushSystemTemp();
+            dxbc::Dest blend_dest_temp_rgb_dest(dxbc::Dest::R(blend_dest_temp, 0b0111));
+            dxbc::Src blend_dest_temp_src(dxbc::Src::R(blend_dest_temp));
+
+            // Extract the destination color factor to temp.x.
+            // temp.x = destination color factor index.
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
+            // Check if the destination color factor is not zero.
+            a_.OpIf(true, temp_x_src);
+            {
+              // temp.x = free.
+              a_.OpSwitch(temp_x_src);
+              // blend_dest_temp.xyz = unclamped destination color factor.
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_dest_temp);
+              a_.OpEndSwitch();
+              // temp.x = whether color is fixed-point.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                // blend_dest_temp.xyz = destination color factor.
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // blend_dest_temp.xyz = destination color multiplied by its
+              //                       factor.
+              a_.OpMul(blend_dest_temp_rgb_dest, color_temp_src, blend_dest_temp_src);
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+            }
+            // The destination color factor is zero.
+            a_.OpElse();
+            {
+              a_.OpMov(blend_dest_temp_rgb_dest, dxbc::Src::LF(0.0f));
+            }
+            a_.OpEndIf();
+
+            // Extract the color min (0) or max (1) bit to temp.x.
             // temp.x = whether min or max should be used for color.
             a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
             // Check if need to do min or max for color.
             // temp.x = free.
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              // color_temp.xyz = max(src * srcFactor, dst * dstFactor).
+              a_.OpMax(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
             }
             // Need to do min.
             a_.OpElse();
             {
-              // Choose min of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              // color_temp.xyz = min(src * srcFactor, dst * dstFactor).
+              a_.OpMin(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
             }
             // Close the min or max check.
             a_.OpEndIf();
+
+            // Release blend_dest_temp and blend_src_temp.
+            PopSystemTemp(2);
           }
           // Close the color factor blending or min/max check.
           a_.OpEndIf();
@@ -2484,29 +2698,111 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
             a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
           }
           // Need to do min/max for alpha.
+          // The Xbox 360 applies the factors before the min/max here too - see
+          // the color path above. Canary 067641668.
           a_.OpElse();
           {
-            // Extract the alpha min (0) or max (1) bit to temp.x.
-            // temp.x = whether min or max should be used for alpha.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
-            // Check if need to do min or max for alpha.
-            // temp.x = free.
+            // temp.x will hold the factored source alpha and temp.y the
+            // factored destination alpha, so the fixed-point flag needs its own
+            // register.
+            uint32_t alpha_is_fixed_temp = PushSystemTemp();
+            dxbc::Dest alpha_is_fixed_dest(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001));
+            dxbc::Src alpha_is_fixed_src(dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+
+            // Extract the source alpha factor to temp.x.
+            // temp.x = source alpha factor index.
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(16), rt_blend_factors_ops_src);
+            // Check if the source alpha factor is not zero.
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMax(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              // temp.x = free.
+              a_.OpSwitch(temp_x_src);
+              // temp.x = unclamped source alpha factor.
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 0);
+              a_.OpEndSwitch();
+              // alpha_is_fixed_temp.x = whether alpha is fixed-point.
+              a_.OpAnd(alpha_is_fixed_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, alpha_is_fixed_src);
+              {
+                // temp.x = source alpha factor.
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // temp.x = source alpha multiplied by its factor.
+              a_.OpMul(temp_x_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                       temp_x_src);
+              a_.OpIf(true, alpha_is_fixed_src);
+              {
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+            }
+            // The source alpha factor is zero.
+            a_.OpElse();
+            {
+              a_.OpMov(temp_x_dest, dxbc::Src::LF(0.0f));
+            }
+            a_.OpEndIf();
+
+            // Extract the destination alpha factor to temp.y.
+            // temp.y = destination alpha factor index.
+            a_.OpUBFE(temp_y_dest, dxbc::Src::LU(5), dxbc::Src::LU(24), rt_blend_factors_ops_src);
+            // Check if the destination alpha factor is not zero.
+            a_.OpIf(true, temp_y_src);
+            {
+              // temp.y = free.
+              a_.OpSwitch(temp_y_src);
+              // temp.y = unclamped destination alpha factor.
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 1);
+              a_.OpEndSwitch();
+              // alpha_is_fixed_temp.x = whether alpha is fixed-point.
+              a_.OpAnd(alpha_is_fixed_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, alpha_is_fixed_src);
+              {
+                // temp.y = destination alpha factor.
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // temp.y = destination alpha multiplied by its factor. This is
+              // the last read of color_temp.w as the destination alpha.
+              a_.OpMul(temp_y_dest, color_temp_a_src, temp_y_src);
+              a_.OpIf(true, alpha_is_fixed_src);
+              {
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+            }
+            // The destination alpha factor is zero.
+            a_.OpElse();
+            {
+              a_.OpMov(temp_y_dest, dxbc::Src::LF(0.0f));
+            }
+            a_.OpEndIf();
+
+            // Release alpha_is_fixed_temp.
+            PopSystemTemp();
+
+            // Extract the alpha min (0) or max (1) bit to color_temp.w - temp.x
+            // and temp.y are both still holding the factored alphas.
+            // color_temp.w = whether min or max should be used for alpha.
+            a_.OpAnd(color_temp_a_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
+            // Check if need to do min or max for alpha.
+            a_.OpIf(true, color_temp_a_src);
+            {
+              // color_temp.w = max(src * srcFactor, dst * dstFactor).
+              a_.OpMax(color_temp_a_dest, temp_x_src, temp_y_src);
             }
             // Need to do min.
             a_.OpElse();
             {
-              // Choose min of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMin(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              // color_temp.w = min(src * srcFactor, dst * dstFactor).
+              a_.OpMin(color_temp_a_dest, temp_x_src, temp_y_src);
             }
             // Close the min or max check.
             a_.OpEndIf();

@@ -1186,9 +1186,22 @@ static void ParseAluInstructionOperand(const AluInstruction& op, uint32_t i,
     // Scalar `a` (W).
     out_op.components[0] = GetSwizzledAluSourceComponent(swizzle, 3);
   } else if (swizzle_component_count == 2) {
-    // Scalar left-hand `a` (W) and right-hand `b` (X).
+    // Scalar left-hand `a` (W) and right-hand `b` (X OR Z).
+    // A two-component scalar operand always comes from source 3, which the scalar half of the
+    // instruction SHARES with the vector half. When the co-issued vector op takes three sources
+    // (mad, cndeq, cndge, cndgt, dp2add) source 3 is already claimed by the vector op, and the
+    // hardware then takes `b` from Z instead of X. Reading X unconditionally mis-swizzles every
+    // two-component scalar op -- adds, muls, muls_prev2, maxs, mins, subs, maxas, maxasf, i.e.
+    // the hot ones -- whenever it is co-issued with mad or a cnd*, and since both DXBC and
+    // SPIR-V read components[1] straight off this parse, the wrong component reaches BOTH
+    // backends. Read off op here rather than plumbed in as a parameter: a count of 2 is only
+    // ever reached from the scalar source-3 call in ParseAluInstruction, so the vector opcode
+    // is the entire condition.
+    // Adopted by content from xenia-canary 92ada8ebc.
     out_op.components[0] = GetSwizzledAluSourceComponent(swizzle, 3);
-    out_op.components[1] = GetSwizzledAluSourceComponent(swizzle, 0);
+    out_op.components[1] = GetSwizzledAluSourceComponent(
+        swizzle,
+        ucode::GetAluVectorOpcodeInfo(op.vector_opcode()).GetOperandCount() == 3 ? 2 : 0);
   } else if (swizzle_component_count == 3) {
     assert_always();
   } else if (swizzle_component_count == 4) {

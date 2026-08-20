@@ -452,10 +452,20 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                       id_vector_temp_));
     }
     builder_->makeNewBlock();
-    if (edram_fragment_shader_interlock_) {
-      // Skip the alpha test and alpha to coverage if the render target 0 is not
-      // written to dynamically.
-      fsi_sample_mask_in_rt_0_alpha_tests = main_fsi_sample_mask_;
+    // Skip the alpha test and alpha to coverage if render target 0 is not
+    // written to on the taken execution path. This used to run only with
+    // fragment shader interlock: on the host render target path the color lived
+    // in a write-only SPIR-V Output variable, so there was nothing to track and
+    // nothing to read, and an unwritten render target 0 was alpha-tested against
+    // the zero-initialized output - killing or keeping the fragment on garbage
+    // alpha. Now that the FBO path keeps the color in a Function variable and
+    // maintains var_main_fsi_color_written_, the same check applies there. The
+    // variable is non-null exactly when the shader writes any color target, so
+    // it is the condition. Canary 966d8f092.
+    if (var_main_fsi_color_written_ != spv::NoResult) {
+      if (edram_fragment_shader_interlock_) {
+        fsi_sample_mask_in_rt_0_alpha_tests = main_fsi_sample_mask_;
+      }
       spv::Id rt_0_written = builder_->createBinOp(
           spv::OpINotEqual, type_bool_,
           builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
@@ -503,10 +513,13 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     {
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(3));
+      // Always Function storage. The host render target path used to reach into
+      // the framebuffer Output variable here, which SPIR-V defines as write-only
+      // - the value read back was whatever the implementation happened to leave
+      // there, not the color the shader computed. Canary 966d8f092.
       spv::Id alpha_test_alpha = builder_->createLoad(
-          builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
-                                                                       : spv::StorageClassOutput,
-                                      output_or_var_fragment_data_[0], id_vector_temp_),
+          builder_->createAccessChain(spv::StorageClassFunction, output_or_var_fragment_data_[0],
+                                      id_vector_temp_),
           spv::NoPrecision);
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantAlphaTestReference));
@@ -604,9 +617,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         }
         id_vector_temp_.clear();
         id_vector_temp_.push_back(builder_->makeIntConstant(3));
+        // Always Function storage - same write-only Output read the alpha test
+        // had. Canary 966d8f092.
         spv::Id alpha_to_coverage_alpha = builder_->createLoad(
-            builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
-                                                                         : spv::StorageClassOutput,
+            builder_->createAccessChain(spv::StorageClassFunction,
                                         output_or_var_fragment_data_[0], id_vector_temp_),
             spv::NoPrecision);
         assert_true(input_fragment_coordinates_ != spv::NoResult);
@@ -775,12 +789,17 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       if_alpha_to_coverage_enabled.makeEndIf();
     }
 
-    if (edram_fragment_shader_interlock_) {
-      // Close the render target 0 written check.
+    if (block_fsi_rt_0_alpha_tests_rt_written_merge) {
+      // Close the render target 0 written check. Taken on both paths now, so
+      // close on whether the region was actually opened rather than on which
+      // render backend this is; the sample mask phi below stays fragment shader
+      // interlock only, because main_fsi_sample_mask_ and
+      // fsi_sample_mask_in_rt_0_alpha_tests are spv::NoResult on the host render
+      // target path. Canary 966d8f092.
       builder_->createBranch(block_fsi_rt_0_alpha_tests_rt_written_merge);
       spv::Block& block_fsi_rt_0_alpha_tests_rt_written_end = *builder_->getBuildPoint();
       builder_->setBuildPoint(block_fsi_rt_0_alpha_tests_rt_written_merge);
-      if (!features_.demote_to_helper_invocation) {
+      if (edram_fragment_shader_interlock_ && !features_.demote_to_helper_invocation) {
         // The tests might have modified the sample mask via
         // fsi_sample_mask_in_rt_0_alpha_tests.
         id_vector_temp_.clear();
@@ -1324,6 +1343,129 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         if_rt_write_mask_not_empty.makeEndIf();
         if_fsi_color_written.makeEndIf();
       } else {
+        // Vulkan's VK_BLEND_OP_MIN/MAX ignore the blend factors, but the Xbox
+        // 360 applies them before the min/max, so a MIN/MAX draw with a
+        // kSrcAlpha source factor used to blend as if the factor were ONE. The
+        // destination is not readable here, so only the source side is
+        // emulated, by pre-multiplying the shader output;
+        // VulkanPipelineCache::GetCurrentPixelShaderModification only requests
+        // this when the destination factor is ONE, and forces the pipeline's
+        // source factor to ONE so it isn't applied twice. Done before the gamma
+        // conversion below on purpose - min/max commutes with the monotonic
+        // gamma curve, the multiply does not. RT0 only. Canary 067641668.
+        if (color_target_index == 0) {
+          xenos::BlendFactor rt0_rgb_premult_factor =
+              GetSpirvShaderModification().pixel.rt0_blend_rgb_factor_for_premult;
+          xenos::BlendFactor rt0_a_premult_factor =
+              GetSpirvShaderModification().pixel.rt0_blend_a_factor_for_premult;
+          if (rt0_rgb_premult_factor != xenos::BlendFactor::kOne ||
+              rt0_a_premult_factor != xenos::BlendFactor::kOne) {
+            auto extract_rgb = [&](spv::Id vec4) -> spv::Id {
+              uint_vector_temp_.clear();
+              uint_vector_temp_.push_back(0);
+              uint_vector_temp_.push_back(1);
+              uint_vector_temp_.push_back(2);
+              return builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, vec4,
+                                                   uint_vector_temp_);
+            };
+            auto load_blend_constant = [&]() -> spv::Id {
+              id_vector_temp_.clear();
+              id_vector_temp_.push_back(
+                  builder_->makeIntConstant(kSystemConstantEdramBlendConstant));
+              return builder_->createLoad(
+                  builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                              id_vector_temp_),
+                  spv::NoPrecision);
+            };
+            // Only the source side is available, so factors that need the
+            // destination fall through to 1 (no pre-multiply).
+            auto get_factor_value = [&](xenos::BlendFactor factor, bool for_alpha) -> spv::Id {
+              spv::Id one = for_alpha ? const_float_1_ : const_float3_1_;
+              spv::Id factor_type = for_alpha ? type_float_ : type_float3_;
+              switch (factor) {
+                case xenos::BlendFactor::kZero:
+                  return for_alpha ? const_float_0_ : const_float3_0_;
+                case xenos::BlendFactor::kSrcColor:
+                  return for_alpha ? builder_->createCompositeExtract(color, type_float_, 3)
+                                   : extract_rgb(color);
+                case xenos::BlendFactor::kOneMinusSrcColor:
+                  return builder_->createNoContractionBinOp(
+                      spv::OpFSub, factor_type, one,
+                      for_alpha ? builder_->createCompositeExtract(color, type_float_, 3)
+                                : extract_rgb(color));
+                case xenos::BlendFactor::kSrcAlpha: {
+                  spv::Id alpha = builder_->createCompositeExtract(color, type_float_, 3);
+                  return for_alpha ? alpha
+                                   : builder_->smearScalar(spv::NoPrecision, alpha, type_float3_);
+                }
+                case xenos::BlendFactor::kOneMinusSrcAlpha: {
+                  spv::Id one_minus_alpha = builder_->createNoContractionBinOp(
+                      spv::OpFSub, type_float_, const_float_1_,
+                      builder_->createCompositeExtract(color, type_float_, 3));
+                  return for_alpha ? one_minus_alpha
+                                   : builder_->smearScalar(spv::NoPrecision, one_minus_alpha,
+                                                           type_float3_);
+                }
+                case xenos::BlendFactor::kConstantColor: {
+                  spv::Id blend_constant = load_blend_constant();
+                  return for_alpha
+                             ? builder_->createCompositeExtract(blend_constant, type_float_, 3)
+                             : extract_rgb(blend_constant);
+                }
+                case xenos::BlendFactor::kOneMinusConstantColor: {
+                  spv::Id blend_constant = load_blend_constant();
+                  return builder_->createNoContractionBinOp(
+                      spv::OpFSub, factor_type, one,
+                      for_alpha ? builder_->createCompositeExtract(blend_constant, type_float_, 3)
+                                : extract_rgb(blend_constant));
+                }
+                case xenos::BlendFactor::kConstantAlpha: {
+                  spv::Id constant_alpha =
+                      builder_->createCompositeExtract(load_blend_constant(), type_float_, 3);
+                  return for_alpha ? constant_alpha
+                                   : builder_->smearScalar(spv::NoPrecision, constant_alpha,
+                                                           type_float3_);
+                }
+                case xenos::BlendFactor::kOneMinusConstantAlpha: {
+                  spv::Id one_minus_constant_alpha = builder_->createNoContractionBinOp(
+                      spv::OpFSub, type_float_, const_float_1_,
+                      builder_->createCompositeExtract(load_blend_constant(), type_float_, 3));
+                  return for_alpha ? one_minus_constant_alpha
+                                   : builder_->smearScalar(spv::NoPrecision,
+                                                           one_minus_constant_alpha, type_float3_);
+                }
+                default:
+                  // kOne, kSrcAlphaSaturate for alpha, or a factor that needs
+                  // the destination - nothing to pre-multiply by.
+                  return one;
+              }
+            };
+            spv::Id premultiplied[4];
+            for (uint32_t i = 0; i < 4; ++i) {
+              premultiplied[i] = builder_->createCompositeExtract(color, type_float_, i);
+            }
+            if (rt0_rgb_premult_factor != xenos::BlendFactor::kOne) {
+              spv::Id rgb = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float3_, extract_rgb(color),
+                  get_factor_value(rt0_rgb_premult_factor, false));
+              for (uint32_t i = 0; i < 3; ++i) {
+                premultiplied[i] = builder_->createCompositeExtract(rgb, type_float_, i);
+              }
+            }
+            if (rt0_a_premult_factor != xenos::BlendFactor::kOne) {
+              premultiplied[3] = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float_,
+                  builder_->createCompositeExtract(color, type_float_, 3),
+                  get_factor_value(rt0_a_premult_factor, true));
+            }
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(premultiplied[0]);
+            id_vector_temp_.push_back(premultiplied[1]);
+            id_vector_temp_.push_back(premultiplied[2]);
+            id_vector_temp_.push_back(premultiplied[3]);
+            color = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+          }
+        }
         // Convert to gamma space - this is incorrect, since it must be done
         // after blending on the Xbox 360, but this is just one of many blending
         // issues in the host render target path.
@@ -1402,6 +1544,27 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       depth = SpirvShaderTranslator::Depth20e4To32(*builder_, depth_float24, 0, true, false,
                                                    ext_inst_glsl_std_450_);
       builder_->createStore(depth, output_fragment_depth_);
+    }
+  }
+
+  if (!edram_fragment_shader_interlock_) {
+    // Host render target path: publish the Function-scoped colors into the real
+    // framebuffer Output variables, now that the alpha test, alpha to coverage,
+    // the exponent bias and the gamma conversion have all run against them. The
+    // colors are kept in Function variables for the whole shader precisely
+    // because SPIR-V Output variables are write-only and the alpha test has to
+    // read the alpha back. This is the single write to each attachment, so it
+    // also replaces the "initialize the colors for safety" stores that used to
+    // sit at the end of StartFragmentShaderInMain. Canary 966d8f092.
+    uint32_t color_targets_to_copy = current_shader().writes_color_targets();
+    uint32_t copy_color_target_index;
+    while (rex::bit_scan_forward(color_targets_to_copy, &copy_color_target_index)) {
+      color_targets_to_copy &= ~(UINT32_C(1) << copy_color_target_index);
+      spv::Id var_color = output_or_var_fragment_data_[copy_color_target_index];
+      spv::Id out_color = output_fragment_data_[copy_color_target_index];
+      if (var_color != spv::NoResult && out_color != spv::NoResult) {
+        builder_->createStore(builder_->createLoad(var_color, spv::NoPrecision), out_color);
+      }
     }
   }
 
@@ -3280,7 +3443,36 @@ spv::Id SpirvShaderTranslator::FSI_BlendColorOrAlphaWithUnclampedResult(
                (dest_color != spv::NoResult || constant_color_clamped != spv::NoResult));
   spv::Id value_type = is_alpha ? type_float_ : type_float3_;
 
-  // Handle min and max blend operations, which don't involve the factors.
+  // The Xbox 360 applies the source and destination blend factors BEFORE the
+  // MIN/MAX operation - unlike Vulkan's VK_BLEND_OP_MIN/MAX, which ignore them
+  // entirely. Taking min/max of the raw clamped values made every MIN/MAX draw
+  // with a non-ONE source factor (typically kSrcAlpha) blend as if the factor
+  // were ONE. Compute both factored terms up front so the min and max cases can
+  // use them too - the factor control flow now runs before the equation switch
+  // instead of only inside its default case, so block_min_max_head must be
+  // captured after these calls. Canary 067641668.
+  spv::Id term_source, term_dest;
+  if (is_alpha) {
+    term_source = FSI_ApplyAlphaBlendFactor(source_alpha_clamped, is_fixed_point, clamp_min_value,
+                                            clamp_max_value, source_factor, source_alpha_clamped,
+                                            dest_alpha, constant_alpha_clamped);
+    term_dest = FSI_ApplyAlphaBlendFactor(dest_alpha, is_fixed_point, clamp_min_value,
+                                          clamp_max_value, dest_factor, source_alpha_clamped,
+                                          dest_alpha, constant_alpha_clamped);
+  } else {
+    term_source = FSI_ApplyColorBlendFactor(source_color_clamped, is_fixed_point, clamp_min_value,
+                                            clamp_max_value, source_factor, source_color_clamped,
+                                            source_alpha_clamped, dest_color, dest_alpha,
+                                            constant_color_clamped, constant_alpha_clamped);
+    term_dest = FSI_ApplyColorBlendFactor(dest_color, is_fixed_point, clamp_min_value,
+                                          clamp_max_value, dest_factor, source_color_clamped,
+                                          source_alpha_clamped, dest_color, dest_alpha,
+                                          constant_color_clamped, constant_alpha_clamped);
+  }
+
+  // Handle min and max blend operations, which use the factored terms above.
+  // Both terms are already flushed and clamped by FSI_Apply*BlendFactor, so
+  // their min/max needs no further clamping.
   spv::Block& block_min_max_head = *builder_->getBuildPoint();
   spv::Block& block_min_max_min = builder_->makeNewBlock();
   spv::Block& block_min_max_max = builder_->makeNewBlock();
@@ -3302,43 +3494,23 @@ spv::Id SpirvShaderTranslator::FSI_BlendColorOrAlphaWithUnclampedResult(
   block_min_max_min.addPredecessor(&block_min_max_head);
   block_min_max_max.addPredecessor(&block_min_max_head);
 
-  // Min case.
+  // Min case - min(src * srcFactor, dst * dstFactor).
   builder_->setBuildPoint(&block_min_max_min);
-  spv::Id result_min = builder_->createBinBuiltinCall(
-      value_type, ext_inst_glsl_std_450_, GLSLstd450FMin,
-      is_alpha ? source_alpha_clamped : source_color_clamped, is_alpha ? dest_alpha : dest_color);
+  spv::Id result_min = builder_->createBinBuiltinCall(value_type, ext_inst_glsl_std_450_,
+                                                      GLSLstd450FMin, term_source, term_dest);
   builder_->createBranch(&block_min_max_merge);
 
-  // Max case.
+  // Max case - max(src * srcFactor, dst * dstFactor).
   builder_->setBuildPoint(&block_min_max_max);
-  spv::Id result_max = builder_->createBinBuiltinCall(
-      value_type, ext_inst_glsl_std_450_, GLSLstd450FMax,
-      is_alpha ? source_alpha_clamped : source_color_clamped, is_alpha ? dest_alpha : dest_color);
+  spv::Id result_max = builder_->createBinBuiltinCall(value_type, ext_inst_glsl_std_450_,
+                                                      GLSLstd450FMax, term_source, term_dest);
   builder_->createBranch(&block_min_max_merge);
 
-  // Blending with factors.
+  // Blending with factors - the terms are already computed above, only the
+  // signs of the addition are chosen here.
   spv::Id result_factors;
   {
     builder_->setBuildPoint(&block_min_max_default);
-
-    spv::Id term_source, term_dest;
-    if (is_alpha) {
-      term_source = FSI_ApplyAlphaBlendFactor(source_alpha_clamped, is_fixed_point, clamp_min_value,
-                                              clamp_max_value, source_factor, source_alpha_clamped,
-                                              dest_alpha, constant_alpha_clamped);
-      term_dest = FSI_ApplyAlphaBlendFactor(dest_alpha, is_fixed_point, clamp_min_value,
-                                            clamp_max_value, dest_factor, source_alpha_clamped,
-                                            dest_alpha, constant_alpha_clamped);
-    } else {
-      term_source = FSI_ApplyColorBlendFactor(source_color_clamped, is_fixed_point, clamp_min_value,
-                                              clamp_max_value, source_factor, source_color_clamped,
-                                              source_alpha_clamped, dest_color, dest_alpha,
-                                              constant_color_clamped, constant_alpha_clamped);
-      term_dest = FSI_ApplyColorBlendFactor(dest_color, is_fixed_point, clamp_min_value,
-                                            clamp_max_value, dest_factor, source_color_clamped,
-                                            source_alpha_clamped, dest_color, dest_alpha,
-                                            constant_color_clamped, constant_alpha_clamped);
-    }
 
     spv::Block& block_signs_head = *builder_->getBuildPoint();
     spv::Block& block_signs_add = builder_->makeNewBlock();

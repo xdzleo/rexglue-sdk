@@ -113,9 +113,18 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
   uint_vector_temp_.push_back(1);
   uint_vector_temp_.push_back(0);
   uint_vector_temp_.push_back(3);
+  // Before SPIR-V 1.4, an OpSelect with a vector result type requires a
+  // vector-of-bool condition; a scalar one is malformed SPIR-V, not just a
+  // validator complaint, and we still emit Spv_1_0 when the device lacks 1.4.
+  // On those drivers this select is undefined: the red/blue swap may be dropped
+  // or the module may fail to compile, and memexport then writes channel-swapped
+  // data back to guest memory. Hoisted out of the loop so the smear is emitted
+  // once rather than once per eM. Canary 6de637b79.
+  spv::Id swap_red_blue_bool4 =
+      builder_->smearScalar(spv::NoPrecision, swap_red_blue, type_bool4_);
   for_each_eM([&](uint32_t eM_index) {
     eM_swapped[eM_index] = builder_->createTriOp(
-        spv::OpSelect, type_float4_, swap_red_blue,
+        spv::OpSelect, type_float4_, swap_red_blue_bool4,
         builder_->createRvalueSwizzle(spv::NoPrecision, type_float4_, eM_original[eM_index],
                                       uint_vector_temp_),
         eM_original[eM_index]);

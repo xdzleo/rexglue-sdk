@@ -140,10 +140,34 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   // - Load needed words to system_temp_result_, words 0, 1, 2, 3 to X, Y, Z, W
   //   respectively.
 
-  // FIXME(Triang3l): Bound checking is not done here, but haven't encountered
-  // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
-  // P705), however, words (not full elements) out of glBufferData bounds
-  // contain 0.
+  // Words at or past the end of the fetch buffer must read as 0. The shared
+  // memory binding covers all of physical memory, so an out-of-bounds word
+  // loads whatever unrelated guest data happens to sit there instead of the
+  // zeros the hardware clamps to - an overallocated draw then produces stray or
+  // exploding geometry instead of the degenerate primitives the title expects.
+  // Compute the exclusive end of the buffer in bytes from the fetch constant,
+  // and a mask of which words of the element fall inside it, here while
+  // address_src still points at the first needed word. Canary 9e9d3cdd3.
+  uint32_t bounds_temp = PushSystemTemp(0, 2);
+  uint32_t word_mask_temp = bounds_temp + 1;
+  // bounds_temp.x = buffer size in words (bits 2:25 of the second fetch
+  // constant word).
+  a_.OpUBFE(dxbc::Dest::R(bounds_temp, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(2),
+            fetch_constant_src.SelectFromSwizzled(1));
+  // bounds_temp.y = base address of the buffer in bytes.
+  a_.OpAnd(dxbc::Dest::R(bounds_temp, 0b0010), fetch_constant_src.SelectFromSwizzled(0),
+           dxbc::Src::LU(~uint32_t(3)));
+  // bounds_temp.x = exclusive end of the buffer in bytes.
+  a_.OpUMAd(dxbc::Dest::R(bounds_temp, 0b0001), dxbc::Src::R(bounds_temp, dxbc::Src::kXXXX),
+            dxbc::Src::LU(4), dxbc::Src::R(bounds_temp, dxbc::Src::kYYYY));
+  // word_mask_temp = byte addresses of the words 0, 1, 2, 3 of the element.
+  a_.OpIAdd(dxbc::Dest::R(word_mask_temp), address_src,
+            dxbc::Src::LI((0 - int32_t(first_word_index)) * 4, (1 - int32_t(first_word_index)) * 4,
+                          (2 - int32_t(first_word_index)) * 4,
+                          (3 - int32_t(first_word_index)) * 4));
+  // word_mask_temp = whether each word is within the buffer bounds.
+  a_.OpULT(dxbc::Dest::R(word_mask_temp, needed_words), dxbc::Src::R(word_mask_temp),
+           dxbc::Src::R(bounds_temp, dxbc::Src::kXXXX));
 
   // Loading the FXC way, Load4.xyw becomes Load2 and Load - would be a
   // compromise between AMD, where there are load_dwordx2/3/4, and Nvidia, where
@@ -205,6 +229,13 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     }
   }
   a_.OpEndIf();
+
+  // Zero the words that fell outside the fetch buffer - ult produced
+  // 0xFFFFFFFF for the in-bounds ones and 0 for the rest (Canary 9e9d3cdd3).
+  a_.OpAnd(dxbc::Dest::R(system_temp_result_, needed_words), dxbc::Src::R(system_temp_result_),
+           dxbc::Src::R(word_mask_temp));
+  // Release bounds_temp and word_mask_temp.
+  PopSystemTemp(2);
 
   dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
 
@@ -873,6 +904,42 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // Fetch constants store size minus 1 - add 1.
       a_.OpIAdd(dxbc::Dest::R(size_and_is_3d_temp, size_needed_components & 0b0111),
                 dxbc::Src::R(size_and_is_3d_temp), dxbc::Src::LU(1));
+      // Unnormalized coordinates address texels of the mip being sampled, not
+      // always the base level. Titles that lock the fetch constant to a single
+      // mip (MipMinLevel == MipMaxLevel) and address that mip's grid were
+      // getting the base level size as the denominator here, so every
+      // reduction after the first sampled at 1/2^mip of the intended position
+      // and read garbage - visible as visibility popping in the HZB reducers
+      // of 555308B6 and 5553080B. Substitute max(size >> mip, 1) when the mip
+      // is locked. Scoped to 2D unnormalized kTextureFetch; everything else
+      // keeps the base level denominator until there is a shared effective LOD
+      // model. This changes only the denominator.
+      // Ported from Xenia Canary 8486e97a0.
+      bool selected_mip_grid_possible = instr.opcode == FetchOpcode::kTextureFetch &&
+                                        instr.dimension == xenos::FetchOpDimension::k2D &&
+                                        instr.attributes.unnormalized_coordinates;
+      if (selected_mip_grid_possible) {
+        uint32_t selected_mip_temp = PushSystemTemp();
+        // Fetch constant word 4 has MipMinLevel in bits 2:5 and MipMaxLevel in
+        // bits 6:9.
+        a_.OpUBFE(dxbc::Dest::R(selected_mip_temp, 0b0011), dxbc::Src::LU(4, 4, 0, 0),
+                  dxbc::Src::LU(2, 6, 0, 0), RequestTextureFetchConstantWord(tfetch_index, 4));
+        a_.OpIEq(dxbc::Dest::R(selected_mip_temp, 0b0100),
+                 dxbc::Src::R(selected_mip_temp, dxbc::Src::kXXXX),
+                 dxbc::Src::R(selected_mip_temp, dxbc::Src::kYYYY));
+        // max(size >> mip, 1) for non-power-of-two textures. Resolution
+        // scaling stays unchanged.
+        a_.OpUShR(dxbc::Dest::R(selected_mip_temp, 0b1010),
+                  dxbc::Src::R(size_and_is_3d_temp, 0b01000000),
+                  dxbc::Src::R(selected_mip_temp, dxbc::Src::kXXXX));
+        a_.OpUMax(dxbc::Dest::R(selected_mip_temp, 0b1010), dxbc::Src::R(selected_mip_temp),
+                  dxbc::Src::LU(1));
+        a_.OpMovC(dxbc::Dest::R(size_and_is_3d_temp, 0b0011),
+                  dxbc::Src::R(selected_mip_temp, dxbc::Src::kZZZZ),
+                  dxbc::Src::R(selected_mip_temp, 0b00001101),
+                  dxbc::Src::R(size_and_is_3d_temp));
+        PopSystemTemp();
+      }
       // Convert the size to float for multiplication/division.
       a_.OpUToF(dxbc::Dest::R(size_and_is_3d_temp, size_needed_components & 0b0111),
                 dxbc::Src::R(size_and_is_3d_temp));

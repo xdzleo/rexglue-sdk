@@ -210,8 +210,18 @@ void XThread::InitializeGuestObject() {
   guest_thread->wait_timeout_block.wait_list_entry.blink_ptr = guest_ptr + 0x20;
   guest_thread->wait_timeout_block.thread = guest_ptr;
   guest_thread->wait_timeout_block.object = guest_ptr + 0x18;
-  guest_thread->wait_timeout_block.wait_result_xstatus = 0x0100;
-  guest_thread->wait_timeout_block.wait_type = 0x0201;
+  // Canary dc4db67f9 (src/xenia/kernel/xthread.cc:199-200). Both fields are
+  // be<uint16_t> (xthread.h:134-135) and what we wrote here was magic that
+  // decodes to the wrong things: 0x0100 is STATUS_KERNEL_APC, not
+  // STATUS_TIMEOUT (0x0102), and 0x0201 is not a wait type at all -- the only
+  // members are WaitAll=0, WaitAny=1, WaitUnk3=3. Nothing on the host side
+  // reads either field (the writes below are the only references in src/ and
+  // include/), so the sole consumer is guest code walking its own KTHREAD --
+  // which is precisely why they have to be truthful. This is the block the
+  // built-in wait timeout timer satisfies, so the status it hands back is
+  // STATUS_TIMEOUT and the wait reason is WaitAny.
+  guest_thread->wait_timeout_block.wait_result_xstatus = static_cast<uint16_t>(X_STATUS_TIMEOUT);
+  guest_thread->wait_timeout_block.wait_type = 1;  // X_KWAIT_REASON WaitAny
 
   guest_thread->stack_base = stack_base_;
   guest_thread->stack_limit = stack_limit_;
