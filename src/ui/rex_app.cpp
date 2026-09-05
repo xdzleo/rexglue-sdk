@@ -12,6 +12,7 @@
 #include <rex/rex_app.h>
 
 #include <cstdlib>
+#include <fstream>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -110,6 +111,39 @@ bool ReXApp::SetupEnvironment() {
   if (!game_data_cvar.empty()) {
     game_dir = game_data_cvar;
   }
+  if (game_dir.empty()) {
+    // Nothing on the command line and nothing in the config -- the user just
+    // double-clicked the exe. Rather than a modal error, take the first
+    // location that actually holds the title (default.xex):
+    //   1) a "game_root.txt" sidecar next to the exe naming the data path
+    //      (a build pipeline writes it, so the data can live anywhere),
+    //   2) a "game" folder next to the exe,
+    //   3) the exe's own folder.
+    auto has_title = [](const std::filesystem::path& p) {
+      std::error_code ec;
+      return std::filesystem::exists(p / "default.xex", ec) ||
+             std::filesystem::exists(p / "Default.xex", ec);
+    };
+    std::error_code ec;
+    auto sidecar = exe_dir / "game_root.txt";
+    if (std::filesystem::exists(sidecar, ec)) {
+      std::ifstream f(sidecar);
+      std::string line;
+      std::getline(f, line);
+      auto a = line.find_first_not_of(" \t\r\n\"");
+      auto b = line.find_last_not_of(" \t\r\n\"");
+      if (a != std::string::npos) {
+        line = line.substr(a, b - a + 1);
+        if (!line.empty() && has_title(line))
+          game_dir = line;
+      }
+    }
+    if (game_dir.empty() && has_title(exe_dir / "game"))
+      game_dir = exe_dir / "game";
+    if (game_dir.empty() && has_title(exe_dir))
+      game_dir = exe_dir;
+  }
+
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
