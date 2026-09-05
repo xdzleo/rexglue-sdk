@@ -140,6 +140,7 @@ class MMIOHandler {
     ptrdiff_t mem_displacement;
     bool is_constant;
     int32_t constant;
+    uint8_t constant_size;  // immediate width in bytes (1 or 4)
   };
 
   static bool TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded_out);

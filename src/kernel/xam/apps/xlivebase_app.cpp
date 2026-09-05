@@ -77,6 +77,20 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005000E: {
+      // XUserFindUsers. Dante's Inferno asks for user profiles while loading a
+      // save; failing the call leaves the title holding the result pointer it
+      // never got, and it dereferences it anyway. Answering success with a
+      // result count of zero is the same "nobody found" the console reports for
+      // an offline profile, and the title takes that path cleanly.
+      REXKRNL_DEBUG("XUserFindUsers({:08X}, {:08X}) -> no users found", buffer_ptr, buffer_length);
+      if (buffer_ptr && buffer_length >= sizeof(uint32_t)) {
+        if (auto* results = memory_->TranslateVirtual(buffer_ptr)) {
+          rex::memory::store_and_swap<uint32_t>(results, 0);
+        }
+      }
+      return X_E_SUCCESS;
+    }
   }
   REXKRNL_ERROR(
       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "

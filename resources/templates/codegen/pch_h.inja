@@ -37,6 +37,15 @@
 #include <rex/thread/mutex.h>
 #include <rex/system/mmio_handler.h>
 
+// Hooks the project itself provides. A [[midasm_hook]] names a function by
+// string, and that function has to be declared somewhere the generated code
+// can see -- without this there is nowhere to put it, and the whole hook
+// mechanism is unusable outside the SDK. Optional: a project with no hooks
+// ships no such header and the include disappears.
+#if __has_include("{{ project }}_hooks.h")
+#include "{{ project }}_hooks.h"
+#endif
+
 #include <atomic>
 #include <cassert>
 #include <csetjmp>
