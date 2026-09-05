@@ -23,6 +23,10 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+
 namespace rex::runtime {
 
 namespace {
@@ -35,8 +39,37 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  uint32_t target = ctx.last_indirect_target;
+  // REX_HEAL_DISCOVER: log the target once and RETURN instead of aborting on the
+  // first one. Two uses, and both need the run to continue past it:
+  //   * the heal loop greps these lines, so one launch surfaces many missing
+  //     functions to register instead of one per rebuild;
+  //   * a target of 0 is not a missing function at all -- it is the title
+  //     calling through a pointer it never filled in, which real hardware
+  //     answered by executing whatever sat at address 0. Aborting turns a
+  //     recoverable no-op into the end of the session.
+  // The continuation runs with the call skipped, so state may be inconsistent;
+  // that is the trade this mode exists to make, and it stays opt-in.
+  static const bool discover = std::getenv("REX_HEAL_DISCOVER") != nullptr;
+  if (discover) {
+    static std::mutex mtx;
+    static std::unordered_set<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (seen.insert(target).second) {
+      REXLOG_WARN("Call to invalid or unregistered function at guest address 0x{:08X}", target);
+    }
+    return;
+  }
+  // Bifurcate "the table missed" from "the call site never consulted the table":
+  // an address that is registered yet still trapped means the two disagree.
+  if (FunctionDispatcher* d = GetBoundFunctionDispatcher()) {
+    PPCFunc* f = d->GetFunction(target);
+    REXLOG_ERROR("trap diagnostics: GetFunction(0x{:08X}) = {} (registered={})", target,
+                 reinterpret_cast<void*>(f), f != nullptr);
+  }
+  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X} "
+            "(called from lr=0x{:08X})",
+            target, static_cast<uint32_t>(ctx.lr));
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
