@@ -13,6 +13,8 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <algorithm>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -143,7 +145,6 @@ bool ReXApp::SetupEnvironment() {
     if (game_dir.empty() && has_title(exe_dir))
       game_dir = exe_dir;
   }
-
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
@@ -341,6 +342,34 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
 bool ReXApp::SetupPresentation() {
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
+  if (config_.gpu_plugin.empty()) {
+    // Nothing chose a GPU. Without one the runtime loads no graphics at all and
+    // the title runs headless -- every Vd* kernel call logs "gpu_plugin not set;
+    // call ignored" and the window stays empty, which reads as a broken port to
+    // anyone who just double-clicked the exe. Adopt a plugin that was staged next
+    // to it: the Xenos one if present, otherwise the only rexgpu-*.dll there.
+    // Two or more with no Xenos stays ambiguous and is left to the cvar.
+    std::error_code ec;
+    auto exe_dir = rex::filesystem::GetExecutableFolder();
+    std::vector<std::string> found;
+    for (const auto& entry : std::filesystem::directory_iterator(exe_dir, ec)) {
+      auto name = entry.path().filename().string();
+      constexpr std::string_view kPrefix = "rexgpu-";
+      if (name.size() > kPrefix.size() + 4 && name.compare(0, kPrefix.size(), kPrefix) == 0 &&
+          name.compare(name.size() - 4, 4, ".dll") == 0) {
+        found.push_back(name.substr(kPrefix.size(), name.size() - kPrefix.size() - 4));
+      }
+    }
+    if (std::find(found.begin(), found.end(), "xenos") != found.end()) {
+      config_.gpu_plugin = "xenos";
+    } else if (found.size() == 1) {
+      config_.gpu_plugin = found.front();
+    }
+    if (!config_.gpu_plugin.empty()) {
+      REXLOG_INFO("gpu_plugin not set; using the '{}' plugin staged next to the executable",
+                  config_.gpu_plugin);
+    }
+  }
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
