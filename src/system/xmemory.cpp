@@ -27,6 +27,8 @@
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
+#include <rex/system/xthread.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
 
@@ -547,6 +549,38 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+    // A fault in recompiled code is reported as a host address on a host thread,
+    // which says nothing about the guest. The registers and the guest link
+    // register chain do: they name the routine that faulted and the ones that
+    // called it, so a crash report can be read without attaching a debugger.
+    // (A null pointer read at guest 0x8 is "some field of a struct nobody
+    // allocated" -- worthless until you know which call passed the null.)
+    if (PPCContext* guest = runtime::current_ppc_context()) {
+      REXSYS_ERROR("  guest lr=0x{:08X} ctr=0x{:08X} r1=0x{:08X}", uint32_t(guest->lr),
+                   guest->ctr.u32, guest->r1.u32);
+      REXSYS_ERROR("  r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X}", guest->r3.u32,
+                   guest->r4.u32, guest->r5.u32, guest->r6.u32, guest->r7.u32, guest->r8.u32);
+      REXSYS_ERROR("  r9={:08X} r10={:08X} r11={:08X} r12={:08X} r30={:08X} r31={:08X}",
+                   guest->r9.u32, guest->r10.u32, guest->r11.u32, guest->r12.u32, guest->r30.u32,
+                   guest->r31.u32);
+      // PPC frames are a linked list: [sp] is the caller's sp, [sp+4] its lr.
+      // Walk it only while the pointer stays inside the guest stack range, so a
+      // wild r1 ends the walk instead of reading arbitrary memory.
+      uint32_t sp = guest->r1.u32;
+      for (int depth = 0; depth < 12; ++depth) {
+        if (sp < system::XThread::kStackAddressRangeBegin ||
+            sp >= system::XThread::kStackAddressRangeEnd || (sp & 3)) {
+          break;
+        }
+        uint32_t next = memory::load_and_swap<uint32_t>(TranslateVirtual(sp));
+        uint32_t lr = memory::load_and_swap<uint32_t>(TranslateVirtual(sp + 4));
+        REXSYS_ERROR("    frame {}: sp=0x{:08X} lr=0x{:08X}", depth, sp, lr);
+        if (next <= sp) {
+          break;
+        }
+        sp = next;
+      }
+    }
     return false;
   }
 
