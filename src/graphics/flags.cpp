@@ -13,7 +13,13 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
-REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
+// Default ON: a texture fetch constant whose type field says "invalid" (0) is
+// still bound by the real GPU -- the type only tells texture from vertex
+// fetches apart. Games rely on it: Captain America builds every Bink plane
+// texture with type 0 (intro and title were flat magenta), and Forza Horizon
+// logs two thousand of them per run. The fork this runtime replaced shipped
+// with the same default and ran the whole fleet on it.
+REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, true, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
