@@ -128,8 +128,15 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
 #if REX_ARCH_AMD64
   uint8_t i = 0;  // Current byte decode index.
   uint8_t rex = 0;
+  // Legacy and mandatory prefixes come before REX. Skipping them is not
+  // cosmetic: without this the REX byte is read as an opcode and every form
+  // that carries one fails to decode, which ends the process on a fault the
+  // handler could have serviced.
+  while (i < 4 && (p[i] == 0x66 || p[i] == 0xF3 || p[i] == 0xF2 || p[i] == 0x67)) {
+    ++i;
+  }
   if ((p[i] & 0xF0) == 0x40) {
-    rex = p[0];
+    rex = p[i];
     ++i;
   }
   if (p[i] == 0x0F && p[i + 1] == 0x38 && p[i + 2] == 0xF1) {
@@ -178,8 +185,41 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
     decoded_out.is_load = false;
     decoded_out.byte_swap = false;
     decoded_out.is_constant = true;
+    decoded_out.constant_size = 4;
     ++i;
+  } else if (p[i] == 0xC6) {
+    // MOV m8, imm8  -- c6 04 0a 08   movb $0x8,(%rdx,%rcx)
+    decoded_out.is_load = false;
+    decoded_out.byte_swap = false;
+    decoded_out.is_constant = true;
+    decoded_out.constant_size = 1;
+    ++i;
+  } else if (p[i] == 0x88) {
+    // MOV m8, r8  -- 88 04 02   movb %al,(%rdx,%rax)
+    decoded_out.is_load = false;
+    decoded_out.byte_swap = false;
+    ++i;
+  } else if (p[i] == 0x8A) {
+    // MOV r8, m8  -- 8a 04 02   movb (%rdx,%rax),%al
+    decoded_out.is_load = true;
+    decoded_out.byte_swap = false;
+    ++i;
+  } else if (p[i] == 0x0F && p[i + 1] == 0xB6) {
+    // MOVZX r32, r/m8  -- 0f b6 04 02   movzbl (%rdx,%rax),%eax
+    decoded_out.is_load = true;
+    decoded_out.byte_swap = false;
+    i += 2;
+  } else if (p[i] == 0x0F && p[i + 1] == 0xB7) {
+    // MOVZX r32, r/m16  -- 0f b7 04 02   movzwl (%rdx,%rax),%eax
+    decoded_out.is_load = true;
+    decoded_out.byte_swap = false;
+    i += 2;
   } else {
+    // Anything else -- including the SSE forms (movd/movq/movdqa) -- is left
+    // undecoded on purpose. Recognising them here without teaching the
+    // load/store path to read and write XMM registers would service the fault
+    // against the wrong register, which is worse than not servicing it: a
+    // silent wrong value instead of a diagnosable stop.
     return false;
   }
 
@@ -258,8 +298,13 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
     } break;
   }
   if (decoded_out.is_constant) {
-    decoded_out.constant = memory::load<int32_t>(p + i);
-    i += 4;
+    if (decoded_out.constant_size == 1) {
+      decoded_out.constant = int8_t(p[i]);
+      i += 1;
+    } else {
+      decoded_out.constant = memory::load<int32_t>(p + i);
+      i += 4;
+    }
   }
   decoded_out.length = i;
   return true;
